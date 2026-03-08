@@ -263,11 +263,147 @@ impl<R: BufRead + Seek> FstReader<R> {
             }
         }
     }
+
+    /// Read the most recent signal values before the specified start time.
+    /// 
+    /// This function finds the latest value for each specified signal that occurs
+    /// before the `filter.start` time. It searches backwards through the data
+    /// sections and stops early once all requested signals have been found.
+    /// 
+    /// # Returns
+    /// A `PreStartValues` struct containing both string and real signal values,
+    /// each with their signal handle, value, and the time at which they occurred.
+    pub fn read_pre_start_values(&mut self, filter: &FstFilter) -> Result<PreStartValues> {
+        // convert user filters
+        let signal_count = self.meta.signals.len();
+        let signal_mask = if let Some(signals) = &filter.include {
+            let mut signal_mask = BitMask::repeat(false, signal_count);
+            for sig in signals {
+                let signal_idx = sig.get_index();
+                signal_mask.set(signal_idx, true);
+            }
+            signal_mask
+        } else {
+            // include all
+            BitMask::repeat(true, signal_count)
+        };
+        let data_filter = DataFilter {
+            start: filter.start,
+            end: filter.end.unwrap_or(self.meta.header.end_time),
+            signals: signal_mask,
+        };
+
+        // build and run reader
+        match &mut self.input {
+            InputVariant::Original(input) => {
+                read_pre_start_values(input, &self.meta, &data_filter)
+            }
+            InputVariant::Incomplete(input, _) => {
+                read_pre_start_values(input, &self.meta, &data_filter)
+            }
+            InputVariant::UncompressedInMem(input) => {
+                read_pre_start_values(input, &self.meta, &data_filter)
+            }
+            InputVariant::IncompleteUncompressedInMem(input, _) => {
+                read_pre_start_values(input, &self.meta, &data_filter)
+            }
+        }
+    }
+
+    /// Read the first and last signal values within a specified time range.
+    /// 
+    /// This function efficiently finds the first and last time points within
+    /// the specified time range [filter.start, filter.end] and returns all
+    /// signal values at those time points.
+    /// 
+    /// # Optimization
+    /// This function is optimized for large time ranges:
+    /// - Uses binary search on time tables to quickly locate the first and last time points
+    /// - Only processes the relevant data sections, not the entire file
+    /// - Does not iterate through all time points in the range
+    /// 
+    /// # Returns
+    /// A `RangeBoundaryValues` struct containing optional `TimePointValues` for
+    /// the first and last time points in the range.
+    pub fn read_range_boundary_values(&mut self, filter: &FstFilter) -> Result<RangeBoundaryValues> {
+        // convert user filters
+        let signal_count = self.meta.signals.len();
+        let signal_mask = if let Some(signals) = &filter.include {
+            let mut signal_mask = BitMask::repeat(false, signal_count);
+            for sig in signals {
+                let signal_idx = sig.get_index();
+                signal_mask.set(signal_idx, true);
+            }
+            signal_mask
+        } else {
+            // include all
+            BitMask::repeat(true, signal_count)
+        };
+        let data_filter = DataFilter {
+            start: filter.start,
+            end: filter.end.unwrap_or(self.meta.header.end_time),
+            signals: signal_mask,
+        };
+
+        // build and run reader
+        match &mut self.input {
+            InputVariant::Original(input) => {
+                read_range_boundary_values(input, &self.meta, &data_filter)
+            }
+            InputVariant::Incomplete(input, _) => {
+                read_range_boundary_values(input, &self.meta, &data_filter)
+            }
+            InputVariant::UncompressedInMem(input) => {
+                read_range_boundary_values(input, &self.meta, &data_filter)
+            }
+            InputVariant::IncompleteUncompressedInMem(input, _) => {
+                read_range_boundary_values(input, &self.meta, &data_filter)
+            }
+        }
+    }
 }
 
 pub enum FstSignalValue<'a> {
     String(&'a [u8]),
     Real(f64),
+}
+
+/// Represents a signal value before the start time
+#[derive(Debug, Clone)]
+pub struct PreStartSignalValue {
+    pub handle: FstSignalHandle,
+    pub value: Vec<u8>,
+    pub time: u64,
+}
+
+/// Represents a pre-start real value
+#[derive(Debug, Clone)]
+pub struct PreStartRealValue {
+    pub handle: FstSignalHandle,
+    pub value: f64,
+    pub time: u64,
+}
+
+/// Holds all pre-start signal values
+#[derive(Debug, Clone)]
+pub struct PreStartValues {
+    pub string_values: Vec<PreStartSignalValue>,
+    pub real_values: Vec<PreStartRealValue>,
+}
+
+/// Represents signal values at a specific time point
+#[derive(Debug, Clone)]
+pub struct TimePointValues {
+    pub time: u64,
+    pub string_values: Vec<PreStartSignalValue>,
+    pub real_values: Vec<PreStartRealValue>,
+}
+
+/// Holds the first and last signal values in a time range
+#[derive(Debug, Clone)]
+pub struct RangeBoundaryValues {
+    pub first: Option<TimePointValues>,
+    pub last: Option<TimePointValues>,
 }
 
 /// Quickly scans an input to see if it could be a FST file.
@@ -646,6 +782,21 @@ struct DataReader<'a, R: Read + Seek, F: FnMut(u64, FstSignalHandle, FstSignalVa
     callback: &'a mut F,
 }
 
+struct PreStartReader<'a, R: Read + Seek> {
+    input: &'a mut R,
+    meta: &'a MetaData,
+    filter: &'a DataFilter,
+    string_values: Vec<PreStartSignalValue>,
+    real_values: Vec<PreStartRealValue>,
+    seen_signals: BitMask,
+}
+
+struct RangeBoundaryReader<'a, R: Read + Seek> {
+    input: &'a mut R,
+    meta: &'a MetaData,
+    filter: &'a DataFilter,
+}
+
 impl<R: Read + Seek, F: FnMut(u64, FstSignalHandle, FstSignalValue)> DataReader<'_, R, F> {
     fn read_value_changes(
         &mut self,
@@ -841,4 +992,461 @@ impl<R: Read + Seek, F: FnMut(u64, FstSignalHandle, FstSignalValue)> DataReader<
 
         Ok(())
     }
+}
+
+impl<'a, R: Read + Seek> PreStartReader<'a, R> {
+    fn new(
+        input: &'a mut R,
+        meta: &'a MetaData,
+        filter: &'a DataFilter,
+    ) -> Self {
+        let signal_count = meta.signals.len();
+        PreStartReader {
+            input,
+            meta,
+            filter,
+            string_values: Vec::new(),
+            real_values: Vec::new(),
+            seen_signals: BitMask::repeat(false, signal_count),
+        }
+    }
+
+    fn collect_from_section(&mut self, section: &DataSectionInfo) -> Result<()> {
+        self.input.seek(SeekFrom::Start(section.file_offset))?;
+        let section_length = read_u64(&mut self.input)?;
+        let start_time = read_u64(&mut self.input)?;
+        let end_time = read_u64(&mut self.input)?;
+
+        let (time_section_length, time_table) =
+            read_time_table(&mut self.input, section.file_offset, section_length)?;
+
+        skip_frame(&mut self.input, section.file_offset)?;
+
+        self.collect_value_changes(
+            section.kind,
+            section.file_offset,
+            section_length,
+            time_section_length,
+            &time_table,
+            start_time,
+            end_time,
+        )?;
+
+        Ok(())
+    }
+
+    fn collect_value_changes(
+        &mut self,
+        section_kind: DataSectionKind,
+        section_start: u64,
+        section_length: u64,
+        time_section_length: u64,
+        time_table: &[u64],
+        _section_start_time: u64,
+        _section_end_time: u64,
+    ) -> Result<()> {
+        let (max_handle, _) = read_variant_u64(&mut self.input)?;
+        let vc_start = self.input.stream_position()?;
+        let packtpe = ValueChangePackType::from_u8(read_u8(&mut self.input)?);
+        let chain_len_offset = section_start + section_length - time_section_length - 8;
+        let signal_offsets = read_signal_locs(
+            &mut self.input,
+            chain_len_offset,
+            section_kind,
+            max_handle,
+            vc_start,
+        )?;
+
+        let mut mu: Vec<u8> = Vec::new();
+        let mut head_pointer = vec![0u32; max_handle as usize];
+        let mut length_remaining = vec![0u32; max_handle as usize];
+        let mut scatter_pointer = vec![0u32; max_handle as usize];
+        let mut tc_head = vec![0u32; std::cmp::max(1, time_table.len())];
+
+        for entry in signal_offsets.iter() {
+            if self.filter.signals.is_set(entry.signal_idx) && !self.seen_signals.is_set(entry.signal_idx) {
+                self.input.seek(SeekFrom::Start(vc_start + entry.offset))?;
+                let mut bytes =
+                    read_packed_signal_value_bytes(&mut self.input, entry.len, packtpe)?;
+
+                let len = self.meta.signals[entry.signal_idx].len();
+                let tdelta = if len == 1 {
+                    read_one_bit_signal_time_delta(&bytes, 0)?
+                } else {
+                    read_multi_bit_signal_time_delta(&bytes, 0)?
+                };
+
+                head_pointer[entry.signal_idx] = mu.len() as u32;
+                length_remaining[entry.signal_idx] = bytes.len() as u32;
+                mu.append(&mut bytes);
+
+                scatter_pointer[entry.signal_idx] = tc_head[tdelta];
+                tc_head[tdelta] = entry.signal_idx as u32 + 1;
+            }
+        }
+
+        let mut buffer = Vec::new();
+
+        for (time_id, &time) in time_table.iter().enumerate().rev() {
+            if time >= self.filter.start {
+                continue;
+            }
+
+            let eof_error = || {
+                ReaderError::Io(std::io::Error::new(
+                    std::io::ErrorKind::UnexpectedEof,
+                    "unexpected eof",
+                ))
+            };
+
+            while tc_head[time_id] != 0 {
+                let signal_id = (tc_head[time_id] - 1) as usize;
+                if self.seen_signals.is_set(signal_id) {
+                    tc_head[time_id] = scatter_pointer[signal_id];
+                    continue;
+                }
+
+                let mut mu_slice = &mu.as_slice()[head_pointer[signal_id] as usize..];
+                let (vli, _skiplen) = read_variant_u32(&mut mu_slice)?;
+                let signal_len = self.meta.signals[signal_id].len();
+                let signal_handle = FstSignalHandle::from_index(signal_id);
+
+                match signal_len {
+                    1 => {
+                        let value = one_bit_signal_value_to_char(vli);
+                        self.string_values.push(PreStartSignalValue {
+                            handle: signal_handle,
+                            value: vec![value],
+                            time,
+                        });
+                        self.seen_signals.set(signal_id, true);
+                    }
+                    0 => {
+                        let (len, _) = read_variant_u32(&mut mu_slice)?;
+                        let value = mu_slice.get(..len as usize).ok_or_else(eof_error)?.to_vec();
+                        self.string_values.push(PreStartSignalValue {
+                            handle: signal_handle,
+                            value,
+                            time,
+                        });
+                        self.seen_signals.set(signal_id, true);
+                    }
+                    len => {
+                        if !self.meta.signals[signal_id].is_real() {
+                            let signal_len_usize = len as usize;
+                            let (value_bytes, _) = if (vli & 1) == 0 {
+                                let read_len = signal_len_usize.div_ceil(8);
+                                let bytes = mu_slice.get(..read_len).ok_or_else(eof_error)?;
+                                multi_bit_digital_signal_to_chars(bytes, signal_len_usize, &mut buffer);
+                                (buffer.clone(), read_len as u32)
+                            } else {
+                                let value = mu_slice.get(..signal_len_usize).ok_or_else(eof_error)?.to_vec();
+                                (value, len)
+                            };
+                            self.string_values.push(PreStartSignalValue {
+                                handle: signal_handle,
+                                value: value_bytes,
+                                time,
+                            });
+                            self.seen_signals.set(signal_id, true);
+                        } else {
+                            assert_eq!(vli & 1, 1);
+                            let value = read_f64(&mut mu_slice, self.meta.float_endian)?;
+                            self.real_values.push(PreStartRealValue {
+                                handle: signal_handle,
+                                value,
+                                time,
+                            });
+                            self.seen_signals.set(signal_id, true);
+                        }
+                    }
+                }
+
+                tc_head[time_id] = scatter_pointer[signal_id];
+            }
+        }
+
+        Ok(())
+    }
+
+    fn read(mut self) -> Result<PreStartValues> {
+        let sections = self.meta.data_sections.clone();
+        
+        let relevant_sections = sections
+            .iter()
+            .filter(|s| s.end_time < self.filter.start)
+            .rev()
+            .chain(
+                sections.iter().filter(|s| {
+                    s.start_time < self.filter.start && s.end_time >= self.filter.start
+                })
+            );
+
+        for section in relevant_sections {
+            let all_collected = (0..self.meta.signals.len())
+                .filter(|&i| self.filter.signals.is_set(i))
+                .all(|i| self.seen_signals.is_set(i));
+            if all_collected {
+                break;
+            }
+            self.collect_from_section(section)?;
+        }
+
+        Ok(PreStartValues {
+            string_values: self.string_values,
+            real_values: self.real_values,
+        })
+    }
+}
+
+fn read_pre_start_values(
+    input: &mut (impl Read + Seek),
+    meta: &MetaData,
+    filter: &DataFilter,
+) -> Result<PreStartValues> {
+    let reader = PreStartReader::new(input, meta, filter);
+    reader.read()
+}
+
+impl<'a, R: Read + Seek> RangeBoundaryReader<'a, R> {
+    fn new(
+        input: &'a mut R,
+        meta: &'a MetaData,
+        filter: &'a DataFilter,
+    ) -> Self {
+        RangeBoundaryReader {
+            input,
+            meta,
+            filter,
+        }
+    }
+
+    fn find_first_time_point(&mut self) -> Result<Option<TimePointValues>> {
+        let sections = &self.meta.data_sections;
+        
+        let first_section = sections.iter().find(|s| {
+            s.end_time >= self.filter.start && s.start_time <= self.filter.end
+        });
+
+        let Some(section) = first_section else {
+            return Ok(None);
+        };
+
+        self.input.seek(SeekFrom::Start(section.file_offset))?;
+        let section_length = read_u64(&mut self.input)?;
+        let _ = read_u64(&mut self.input)?;
+        let _ = read_u64(&mut self.input)?;
+
+        let (_, time_table) = read_time_table(
+            &mut self.input,
+            section.file_offset,
+            section_length,
+        )?;
+
+        let first_time_idx = time_table
+            .binary_search(&self.filter.start)
+            .unwrap_or_else(|x| x);
+
+        if first_time_idx >= time_table.len() {
+            return Ok(None);
+        }
+
+        let first_time = time_table[first_time_idx];
+        if first_time > self.filter.end {
+            return Ok(None);
+        }
+
+        self.collect_time_point_values(section, section_length, &time_table, first_time_idx)
+    }
+
+    fn find_last_time_point(&mut self) -> Result<Option<TimePointValues>> {
+        let sections = &self.meta.data_sections;
+        
+        let last_section = sections.iter().rev().find(|s| {
+            s.start_time <= self.filter.end && s.end_time >= self.filter.start
+        });
+
+        let Some(section) = last_section else {
+            return Ok(None);
+        };
+
+        self.input.seek(SeekFrom::Start(section.file_offset))?;
+        let section_length = read_u64(&mut self.input)?;
+        let _ = read_u64(&mut self.input)?;
+        let _ = read_u64(&mut self.input)?;
+
+        let (_, time_table) = read_time_table(
+            &mut self.input,
+            section.file_offset,
+            section_length,
+        )?;
+
+        let last_time_idx = time_table
+            .binary_search(&self.filter.end)
+            .unwrap_or_else(|x| x.saturating_sub(1));
+
+        if last_time_idx >= time_table.len() {
+            return Ok(None);
+        }
+
+        let last_time = time_table[last_time_idx];
+        if last_time < self.filter.start {
+            return Ok(None);
+        }
+
+        self.collect_time_point_values(section, section_length, &time_table, last_time_idx)
+    }
+
+    fn collect_time_point_values(
+        &mut self,
+        section: &DataSectionInfo,
+        section_length: u64,
+        time_table: &[u64],
+        target_time_idx: usize,
+    ) -> Result<Option<TimePointValues>> {
+        skip_frame(&mut self.input, section.file_offset)?;
+
+        let (max_handle, _) = read_variant_u64(&mut self.input)?;
+        let vc_start = self.input.stream_position()?;
+        let packtpe = ValueChangePackType::from_u8(read_u8(&mut self.input)?);
+        let chain_len_offset = section.file_offset + section_length - time_table.len() as u64 * 8 - 8;
+        let signal_offsets = read_signal_locs(
+            &mut self.input,
+            chain_len_offset,
+            section.kind,
+            max_handle,
+            vc_start,
+        )?;
+
+        let mut mu: Vec<u8> = Vec::new();
+        let mut head_pointer = vec![0u32; max_handle as usize];
+        let mut length_remaining = vec![0u32; max_handle as usize];
+        let mut scatter_pointer = vec![0u32; max_handle as usize];
+        let mut tc_head = vec![0u32; std::cmp::max(1, time_table.len())];
+
+        for entry in signal_offsets.iter() {
+            if self.filter.signals.is_set(entry.signal_idx) {
+                self.input.seek(SeekFrom::Start(vc_start + entry.offset))?;
+                let mut bytes =
+                    read_packed_signal_value_bytes(&mut self.input, entry.len, packtpe)?;
+
+                let len = self.meta.signals[entry.signal_idx].len();
+                let tdelta = if len == 1 {
+                    read_one_bit_signal_time_delta(&bytes, 0)?
+                } else {
+                    read_multi_bit_signal_time_delta(&bytes, 0)?
+                };
+
+                head_pointer[entry.signal_idx] = mu.len() as u32;
+                length_remaining[entry.signal_idx] = bytes.len() as u32;
+                mu.append(&mut bytes);
+
+                scatter_pointer[entry.signal_idx] = tc_head[tdelta];
+                tc_head[tdelta] = entry.signal_idx as u32 + 1;
+            }
+        }
+
+        let mut string_values = Vec::new();
+        let mut real_values = Vec::new();
+        let mut buffer = Vec::new();
+
+        for (time_id, &time) in time_table.iter().enumerate() {
+            if time_id > target_time_idx {
+                break;
+            }
+
+            let eof_error = || {
+                ReaderError::Io(std::io::Error::new(
+                    std::io::ErrorKind::UnexpectedEof,
+                    "unexpected eof",
+                ))
+            };
+
+            while tc_head[time_id] != 0 {
+                let signal_id = (tc_head[time_id] - 1) as usize;
+                let mut mu_slice = &mu.as_slice()[head_pointer[signal_id] as usize..];
+                let (vli, _skiplen) = read_variant_u32(&mut mu_slice)?;
+                let signal_len = self.meta.signals[signal_id].len();
+                let signal_handle = FstSignalHandle::from_index(signal_id);
+
+                if time_id == target_time_idx {
+                    match signal_len {
+                        1 => {
+                            let value = one_bit_signal_value_to_char(vli);
+                            string_values.push(PreStartSignalValue {
+                                handle: signal_handle,
+                                value: vec![value],
+                                time,
+                            });
+                        }
+                        0 => {
+                            let (len, _) = read_variant_u32(&mut mu_slice)?;
+                            let value = mu_slice.get(..len as usize).ok_or_else(eof_error)?.to_vec();
+                            string_values.push(PreStartSignalValue {
+                                handle: signal_handle,
+                                value,
+                                time,
+                            });
+                        }
+                        len => {
+                            if !self.meta.signals[signal_id].is_real() {
+                                let signal_len_usize = len as usize;
+                                let (value_bytes, _) = if (vli & 1) == 0 {
+                                    let read_len = signal_len_usize.div_ceil(8);
+                                    let bytes = mu_slice.get(..read_len).ok_or_else(eof_error)?;
+                                    multi_bit_digital_signal_to_chars(bytes, signal_len_usize, &mut buffer);
+                                    (buffer.clone(), read_len as u32)
+                                } else {
+                                    let value = mu_slice.get(..signal_len_usize).ok_or_else(eof_error)?.to_vec();
+                                    (value, len)
+                                };
+                                string_values.push(PreStartSignalValue {
+                                    handle: signal_handle,
+                                    value: value_bytes,
+                                    time,
+                                });
+                            } else {
+                                assert_eq!(vli & 1, 1);
+                                let value = read_f64(&mut mu_slice, self.meta.float_endian)?;
+                                real_values.push(PreStartRealValue {
+                                    handle: signal_handle,
+                                    value,
+                                    time,
+                                });
+                            }
+                        }
+                    }
+                }
+
+                tc_head[time_id] = scatter_pointer[signal_id];
+                scatter_pointer[signal_id] = 0;
+            }
+        }
+
+        if string_values.is_empty() && real_values.is_empty() {
+            Ok(None)
+        } else {
+            Ok(Some(TimePointValues {
+                time: time_table[target_time_idx],
+                string_values,
+                real_values,
+            }))
+        }
+    }
+
+    fn read(mut self) -> Result<RangeBoundaryValues> {
+        let first = self.find_first_time_point()?;
+        let last = self.find_last_time_point()?;
+        
+        Ok(RangeBoundaryValues { first, last })
+    }
+}
+
+fn read_range_boundary_values(
+    input: &mut (impl Read + Seek),
+    meta: &MetaData,
+    filter: &DataFilter,
+) -> Result<RangeBoundaryValues> {
+    let reader = RangeBoundaryReader::new(input, meta, filter);
+    reader.read()
 }
