@@ -9,7 +9,10 @@ mod reader;
 mod types;
 
 pub use io::ReaderError;
-pub use reader::{FstFilter, FstHeader, FstReader, FstSignalValue, is_fst_file};
+pub use reader::{
+    FstFilter, FstHeader, FstReader, FstSignalValue, PreStartSignalValue, PreStartRealValue,
+    PreStartValues, TimePointValues, RangeBoundaryValues, is_fst_file,
+};
 pub use types::{
     FstHierarchyEntry, FstScopeType, FstSignalHandle, FstVarDirection, FstVarType, FstVhdlDataType,
     FstVhdlVarType,

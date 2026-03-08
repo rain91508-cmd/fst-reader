@@ -1237,7 +1237,7 @@ impl<'a, R: Read + Seek> RangeBoundaryReader<'a, R> {
         let _ = read_u64(&mut self.input)?;
         let _ = read_u64(&mut self.input)?;
 
-        let (_, time_table) = read_time_table(
+        let (time_section_length, time_table) = read_time_table(
             &mut self.input,
             section.file_offset,
             section_length,
@@ -1256,7 +1256,7 @@ impl<'a, R: Read + Seek> RangeBoundaryReader<'a, R> {
             return Ok(None);
         }
 
-        self.collect_time_point_values(section, section_length, &time_table, first_time_idx)
+        self.collect_time_point_values(section, section_length, time_section_length, &time_table, first_time_idx)
     }
 
     fn find_last_time_point(&mut self) -> Result<Option<TimePointValues>> {
@@ -1275,7 +1275,7 @@ impl<'a, R: Read + Seek> RangeBoundaryReader<'a, R> {
         let _ = read_u64(&mut self.input)?;
         let _ = read_u64(&mut self.input)?;
 
-        let (_, time_table) = read_time_table(
+        let (time_section_length, time_table) = read_time_table(
             &mut self.input,
             section.file_offset,
             section_length,
@@ -1294,13 +1294,14 @@ impl<'a, R: Read + Seek> RangeBoundaryReader<'a, R> {
             return Ok(None);
         }
 
-        self.collect_time_point_values(section, section_length, &time_table, last_time_idx)
+        self.collect_time_point_values(section, section_length, time_section_length, &time_table, last_time_idx)
     }
 
     fn collect_time_point_values(
         &mut self,
         section: &DataSectionInfo,
         section_length: u64,
+        time_section_length: u64,
         time_table: &[u64],
         target_time_idx: usize,
     ) -> Result<Option<TimePointValues>> {
@@ -1309,7 +1310,7 @@ impl<'a, R: Read + Seek> RangeBoundaryReader<'a, R> {
         let (max_handle, _) = read_variant_u64(&mut self.input)?;
         let vc_start = self.input.stream_position()?;
         let packtpe = ValueChangePackType::from_u8(read_u8(&mut self.input)?);
-        let chain_len_offset = section.file_offset + section_length - time_table.len() as u64 * 8 - 8;
+        let chain_len_offset = section.file_offset + section_length - time_section_length - 8;
         let signal_offsets = read_signal_locs(
             &mut self.input,
             chain_len_offset,
