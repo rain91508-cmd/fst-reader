@@ -1332,6 +1332,7 @@ impl<'a, R: Read + Seek> RangeBoundaryReader<'a, R> {
     }
 
     /// 查找每个信号在区间 [start, end] 内的第一个变化值
+    /// 优化版本：使用动态 mask 跳过已找到的信号和不包含需要信号的块
     fn find_first_in_range(&mut self) -> Result<PreStartValues> {
         let sections = &self.meta.data_sections;
         
@@ -1353,12 +1354,13 @@ impl<'a, R: Read + Seek> RangeBoundaryReader<'a, R> {
         let mut first_real_values: std::collections::HashMap<usize, PreStartRealValue> = 
             std::collections::HashMap::new();
         
-        let target_count = self.filter.signals.count_ones();
+        // 维护还需要搜索的信号 mask
+        let mut search_mask = self.filter.signals.clone();
 
         // 正向遍历数据块
         for section in relevant_sections {
-            // 检查是否已经找到所有信号
-            if first_string_values.len() + first_real_values.len() >= target_count {
+            // 检查是否所有信号都找到了
+            if search_mask.count_ones() == 0 {
                 break;
             }
 
@@ -1388,12 +1390,13 @@ impl<'a, R: Read + Seek> RangeBoundaryReader<'a, R> {
                 vc_start,
             )?;
 
-            // 检查这个数据块里有没有任何我们需要的信号
-            let has_relevant_signals = signal_offsets.iter().any(|entry| {
-                self.filter.signals.is_set(entry.signal_idx)
+            // 检查这个数据块里有没有 search_mask 中的信号
+            let has_needed_signals = signal_offsets.iter().any(|entry| {
+                search_mask.is_set(entry.signal_idx)
             });
             
-            if !has_relevant_signals {
+            if !has_needed_signals {
+                // 这个块没有需要的信号，跳过整个块
                 continue;
             }
 
@@ -1406,19 +1409,13 @@ impl<'a, R: Read + Seek> RangeBoundaryReader<'a, R> {
             };
 
             for entry in signal_offsets.iter() {
-                // 检查是否已经找到所有信号
-                if first_string_values.len() + first_real_values.len() >= target_count {
+                // 检查是否所有信号都找到了
+                if search_mask.count_ones() == 0 {
                     break;
                 }
 
-                // 如果这个信号不是我们关心的，跳过
-                if !self.filter.signals.is_set(entry.signal_idx) {
-                    continue;
-                }
-
-                // 如果这个信号已经找到了，跳过
-                if first_string_values.contains_key(&entry.signal_idx) || 
-                   first_real_values.contains_key(&entry.signal_idx) {
+                // 如果这个信号不需要搜索（已经找到或不在 filter 中），跳过
+                if !search_mask.is_set(entry.signal_idx) {
                     continue;
                 }
 
@@ -1485,6 +1482,8 @@ impl<'a, R: Read + Seek> RangeBoundaryReader<'a, R> {
                                             time: current_time,
                                         }
                                     );
+                                    // 标记为已找到
+                                    search_mask.set(entry.signal_idx, false);
                                     break;
                                 }
                                 0 => {
@@ -1499,6 +1498,8 @@ impl<'a, R: Read + Seek> RangeBoundaryReader<'a, R> {
                                             time: current_time,
                                         }
                                     );
+                                    // 标记为已找到
+                                    search_mask.set(entry.signal_idx, false);
                                     break;
                                 }
                                 len => {
@@ -1524,6 +1525,8 @@ impl<'a, R: Read + Seek> RangeBoundaryReader<'a, R> {
                                                 time: current_time,
                                             }
                                         );
+                                        // 标记为已找到
+                                        search_mask.set(entry.signal_idx, false);
                                         break;
                                     } else {
                                         // 实数信号
@@ -1537,6 +1540,8 @@ impl<'a, R: Read + Seek> RangeBoundaryReader<'a, R> {
                                                 time: current_time,
                                             }
                                         );
+                                        // 标记为已找到
+                                        search_mask.set(entry.signal_idx, false);
                                         break;
                                     }
                                 }
@@ -1606,10 +1611,16 @@ impl<'a, R: Read + Seek> RangeBoundaryReader<'a, R> {
             true,  // 包含 end
         )?;
 
-        // 由于 read_pre_start_values 已经跳过了 end < start 的块
-        // 返回的值应该都在 [start, end] 区间内，不需要额外过滤
-        let last_string_values = end_values.string_values;
-        let last_real_values = end_values.real_values;
+        // 过滤掉 time < start 的信号（这些信号在区间内没有变化）
+        // 注意：read_pre_start_values 可能返回 start 之前的值（如果块包含 start 但变化在 start 之前）
+        let last_string_values: Vec<_> = end_values.string_values
+            .into_iter()
+            .filter(|v| v.time >= self.filter.start)
+            .collect();
+        let last_real_values: Vec<_> = end_values.real_values
+            .into_iter()
+            .filter(|v| v.time >= self.filter.start)
+            .collect();
         
         let last = if last_string_values.is_empty() && last_real_values.is_empty() {
             None
