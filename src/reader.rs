@@ -788,6 +788,7 @@ struct PreStartReader<'a, R: Read + Seek> {
     filter: &'a DataFilter,
     latest_string_values: std::collections::HashMap<usize, (u64, Vec<u8>)>,
     latest_real_values: std::collections::HashMap<usize, (u64, f64)>,
+    target_signal_count: usize,
 }
 
 struct RangeBoundaryReader<'a, R: Read + Seek> {
@@ -999,13 +1000,23 @@ impl<'a, R: Read + Seek> PreStartReader<'a, R> {
         meta: &'a MetaData,
         filter: &'a DataFilter,
     ) -> Self {
+        // 计算目标信号数量（统计 BitMask 中被设置的位数）
+        let target_signal_count = filter.signals.count_ones();
+        
         PreStartReader {
             input,
             meta,
             filter,
             latest_string_values: std::collections::HashMap::new(),
             latest_real_values: std::collections::HashMap::new(),
+            target_signal_count,
         }
+    }
+    
+    /// 检查是否所有目标信号都已经找到值
+    fn all_signals_found(&self) -> bool {
+        let found_count = self.latest_string_values.len() + self.latest_real_values.len();
+        found_count >= self.target_signal_count
     }
 
     fn collect_from_section(&mut self, section: &DataSectionInfo, is_first_section: bool) -> Result<()> {
@@ -1188,21 +1199,47 @@ impl<'a, R: Read + Seek> PreStartReader<'a, R> {
     }
 
     fn read(mut self) -> Result<PreStartValues> {
-        let sections = self.meta.data_sections.clone();
+        let target_time = self.filter.start;
+        let sections = &self.meta.data_sections;
         
-        let relevant_sections = sections
-            .iter()
-            .filter(|s| s.end_time < self.filter.start)
-            .chain(
-                sections.iter().filter(|s| {
-                    s.start_time < self.filter.start && s.end_time >= self.filter.start
-                })
-            );
-
-        let mut is_first_section = true;
-        for section in relevant_sections {
-            self.collect_from_section(section, is_first_section)?;
-            is_first_section = false;
+        if sections.is_empty() {
+            return Ok(PreStartValues {
+                string_values: Vec::new(),
+                real_values: Vec::new(),
+            });
+        }
+        
+        // 步骤1：反向查找包含 target_time 的数据块
+        // 从最后一个块开始，找到第一个 start_time < target_time 的块
+        let start_idx = sections.iter().enumerate().rev().find(|(_, s)| {
+            s.start_time < target_time
+        }).map(|(idx, _)| idx);
+        
+        let Some(start_idx) = start_idx else {
+            // target_time 之前没有任何数据
+            return Ok(PreStartValues {
+                string_values: Vec::new(),
+                real_values: Vec::new(),
+            });
+        };
+        
+        // 步骤2：从找到的块开始，反向遍历处理每个块
+        // 注意：我们反向遍历块，但在每个块内正向遍历时间点
+        for idx in (0..=start_idx).rev() {
+            let section = &sections[idx];
+            
+            // 如果这个块完全在 target_time 之后，跳过
+            if section.start_time >= target_time {
+                continue;
+            }
+            
+            // 处理这个块
+            self.collect_from_section(section, idx == 0)?;
+            
+            // 检查是否所有信号都找到了，如果是则提前终止
+            if self.all_signals_found() {
+                break;
+            }
         }
 
         let mut string_values = Vec::new();

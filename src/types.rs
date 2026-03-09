@@ -404,6 +404,11 @@ impl BitMask {
         let (word_idx, bit_idx) = Self::word_and_bit_index(index);
         (self.inner[word_idx] >> bit_idx) & 1 == 1
     }
+
+    /// 计算被设置为 1 的位数
+    pub(crate) fn count_ones(&self) -> usize {
+        self.inner.iter().map(|word| word.count_ones() as usize).sum()
+    }
 }
 
 pub(crate) struct DataFilter {
