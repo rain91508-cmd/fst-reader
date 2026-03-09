@@ -1224,17 +1224,18 @@ impl<'a, R: Read + Seek> RangeBoundaryReader<'a, R> {
     fn find_first_time_point(&mut self) -> Result<Option<TimePointValues>> {
         let sections = &self.meta.data_sections;
         
-        let first_section = sections.iter().find(|s| {
+        let first_section_idx = sections.iter().position(|s| {
             s.end_time >= self.filter.start && s.start_time <= self.filter.end
         });
 
-        let Some(section) = first_section else {
+        let Some(section_idx) = first_section_idx else {
             return Ok(None);
         };
+        let section = &sections[section_idx];
 
         self.input.seek(SeekFrom::Start(section.file_offset))?;
         let section_length = read_u64(&mut self.input)?;
-        let _ = read_u64(&mut self.input)?;
+        let start_time = read_u64(&mut self.input)?;
         let _ = read_u64(&mut self.input)?;
 
         let (time_section_length, time_table) = read_time_table(
@@ -1242,6 +1243,13 @@ impl<'a, R: Read + Seek> RangeBoundaryReader<'a, R> {
             section.file_offset,
             section_length,
         )?;
+
+        let is_first_section = section_idx == 0;
+        let should_read_frame = is_first_section && (time_table.is_empty() || time_table[0] > start_time);
+
+        if should_read_frame && start_time >= self.filter.start && start_time <= self.filter.end {
+            return self.collect_frame_values(section, section_length, start_time);
+        }
 
         let first_time_idx = time_table
             .binary_search(&self.filter.start)
@@ -1259,16 +1267,63 @@ impl<'a, R: Read + Seek> RangeBoundaryReader<'a, R> {
         self.collect_time_point_values(section, section_length, time_section_length, &time_table, first_time_idx)
     }
 
+    fn collect_frame_values(
+        &mut self,
+        section: &DataSectionInfo,
+        section_length: u64,
+        start_time: u64,
+    ) -> Result<Option<TimePointValues>> {
+        let mut string_values = Vec::new();
+        let mut real_values = Vec::new();
+
+        read_frame(
+            &mut self.input,
+            section.file_offset,
+            section_length,
+            &self.meta.signals,
+            &self.filter.signals,
+            self.meta.float_endian,
+            start_time,
+            &mut |time, handle, value| match value {
+                FstSignalValue::String(bytes) => {
+                    string_values.push(PreStartSignalValue {
+                        handle,
+                        value: bytes.to_vec(),
+                        time,
+                    });
+                }
+                FstSignalValue::Real(value) => {
+                    real_values.push(PreStartRealValue {
+                        handle,
+                        value,
+                        time,
+                    });
+                }
+            },
+        )?;
+
+        if string_values.is_empty() && real_values.is_empty() {
+            Ok(None)
+        } else {
+            Ok(Some(TimePointValues {
+                time: start_time,
+                string_values,
+                real_values,
+            }))
+        }
+    }
+
     fn find_last_time_point(&mut self) -> Result<Option<TimePointValues>> {
         let sections = &self.meta.data_sections;
         
-        let last_section = sections.iter().rev().find(|s| {
+        let last_section_idx = sections.iter().rposition(|s| {
             s.start_time <= self.filter.end && s.end_time >= self.filter.start
         });
 
-        let Some(section) = last_section else {
+        let Some(section_idx) = last_section_idx else {
             return Ok(None);
         };
+        let section = &sections[section_idx];
 
         self.input.seek(SeekFrom::Start(section.file_offset))?;
         let section_length = read_u64(&mut self.input)?;
@@ -1280,6 +1335,10 @@ impl<'a, R: Read + Seek> RangeBoundaryReader<'a, R> {
             section.file_offset,
             section_length,
         )?;
+
+        if time_table.is_empty() {
+            return Ok(None);
+        }
 
         let last_time_idx = time_table
             .binary_search(&self.filter.end)
@@ -1366,11 +1425,11 @@ impl<'a, R: Read + Seek> RangeBoundaryReader<'a, R> {
             while tc_head[time_id] != 0 {
                 let signal_id = (tc_head[time_id] - 1) as usize;
                 let mut mu_slice = &mu.as_slice()[head_pointer[signal_id] as usize..];
-                let (vli, _skiplen) = read_variant_u32(&mut mu_slice)?;
+                let (vli, skiplen) = read_variant_u32(&mut mu_slice)?;
                 let signal_len = self.meta.signals[signal_id].len();
                 let signal_handle = FstSignalHandle::from_index(signal_id);
 
-                if time_id == target_time_idx {
+                let len = if time_id == target_time_idx {
                     match signal_len {
                         1 => {
                             let value = one_bit_signal_value_to_char(vli);
@@ -1379,20 +1438,22 @@ impl<'a, R: Read + Seek> RangeBoundaryReader<'a, R> {
                                 value: vec![value],
                                 time,
                             });
+                            0
                         }
                         0 => {
-                            let (len, _) = read_variant_u32(&mut mu_slice)?;
+                            let (len, skiplen2) = read_variant_u32(&mut mu_slice)?;
                             let value = mu_slice.get(..len as usize).ok_or_else(eof_error)?.to_vec();
                             string_values.push(PreStartSignalValue {
                                 handle: signal_handle,
                                 value,
                                 time,
                             });
+                            len + skiplen2
                         }
                         len => {
                             if !self.meta.signals[signal_id].is_real() {
                                 let signal_len_usize = len as usize;
-                                let (value_bytes, _) = if (vli & 1) == 0 {
+                                let (value_bytes, len_val) = if (vli & 1) == 0 {
                                     let read_len = signal_len_usize.div_ceil(8);
                                     let bytes = mu_slice.get(..read_len).ok_or_else(eof_error)?;
                                     multi_bit_digital_signal_to_chars(bytes, signal_len_usize, &mut buffer);
@@ -1406,6 +1467,7 @@ impl<'a, R: Read + Seek> RangeBoundaryReader<'a, R> {
                                     value: value_bytes,
                                     time,
                                 });
+                                len_val
                             } else {
                                 assert_eq!(vli & 1, 1);
                                 let value = read_f64(&mut mu_slice, self.meta.float_endian)?;
@@ -1414,13 +1476,48 @@ impl<'a, R: Read + Seek> RangeBoundaryReader<'a, R> {
                                     value,
                                     time,
                                 });
+                                8
                             }
                         }
                     }
-                }
+                } else {
+                    match signal_len {
+                        1 => 0,
+                        0 => {
+                            let (len, _) = read_variant_u32(&mut mu_slice)?;
+                            len
+                        }
+                        len => {
+                            if !self.meta.signals[signal_id].is_real() {
+                                if (vli & 1) == 0 {
+                                    (len as usize).div_ceil(8) as u32
+                                } else {
+                                    len
+                                }
+                            } else {
+                                8
+                            }
+                        }
+                    }
+                };
+
+                let total_skiplen = skiplen + len;
+                head_pointer[signal_id] += total_skiplen;
+                length_remaining[signal_id] -= total_skiplen;
 
                 tc_head[time_id] = scatter_pointer[signal_id];
                 scatter_pointer[signal_id] = 0;
+
+                if length_remaining[signal_id] > 0 {
+                    let tdelta = if signal_len == 1 {
+                        read_one_bit_signal_time_delta(&mu, head_pointer[signal_id])?
+                    } else {
+                        read_multi_bit_signal_time_delta(&mu, head_pointer[signal_id])?
+                    };
+
+                    scatter_pointer[signal_id] = tc_head[time_id + tdelta];
+                    tc_head[time_id + tdelta] = (signal_id + 1) as u32;
+                }
             }
         }
 
@@ -1437,6 +1534,8 @@ impl<'a, R: Read + Seek> RangeBoundaryReader<'a, R> {
 
     fn read(mut self) -> Result<RangeBoundaryValues> {
         let first = self.find_first_time_point()?;
+        
+        self.input.seek(SeekFrom::Start(0))?;
         let last = self.find_last_time_point()?;
         
         Ok(RangeBoundaryValues { first, last })
