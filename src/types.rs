@@ -372,6 +372,7 @@ pub(crate) enum HierarchyCompression {
 
 type BitMaskWord = u64;
 
+#[derive(Clone)]
 pub(crate) struct BitMask {
     inner: Vec<BitMaskWord>,
 }

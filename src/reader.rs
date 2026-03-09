@@ -210,6 +210,11 @@ impl<R: BufRead + Seek> FstReader<R> {
         }
     }
 
+    /// Get a reference to the metadata
+    pub fn meta(&self) -> &MetaData {
+        &self.meta
+    }
+
     /// Reads the hierarchy and calls callback for every item.
     pub fn read_hierarchy(&mut self, callback: impl FnMut(FstHierarchyEntry)) -> Result<()> {
         match &mut self.input {
@@ -264,17 +269,36 @@ impl<R: BufRead + Seek> FstReader<R> {
         }
     }
 
-    /// Read the most recent signal values before the specified start time.
-    /// 
+    /// Read the most recent signal values within a specified time range.
+    ///
     /// This function finds the latest value for each specified signal that occurs
-    /// before the `filter.start` time. It searches backwards through the data
-    /// sections and stops early once all requested signals have been found.
-    /// 
+    /// at or before the `filter.end` time, but not before `filter.start`.
+    /// It searches backwards through the data sections and stops early once all
+    /// requested signals have been found.
+    ///
+    /// # Parameters
+    /// - `filter.start`: The minimum time (inclusive). Values before this time are ignored.
+    /// - `filter.end`: The target time (inclusive if include_target is true). 
+    ///                 Finds the latest value at or before this time.
+    ///
     /// # Returns
     /// A `PreStartValues` struct containing both string and real signal values,
     /// each with their signal handle, value, and the time at which they occurred.
+    /// Only values within [start, end] are returned.
     pub fn read_pre_start_values(&mut self, filter: &FstFilter) -> Result<PreStartValues> {
+        self.read_pre_start_values_internal(filter, false)
+    }
+
+    /// Internal implementation of read_pre_start_values with include_target parameter
+    fn read_pre_start_values_internal(
+        &mut self,
+        filter: &FstFilter,
+        include_target: bool,
+    ) -> Result<PreStartValues> {
         // convert user filters
+        // 新的参数语义：
+        // - filter.start: min_time（最小时间，返回的值必须 >= start）
+        // - filter.end: target_time（目标时间，查找 end 之前/包含的最近值）
         let signal_count = self.meta.signals.len();
         let signal_mask = if let Some(signals) = &filter.include {
             let mut signal_mask = BitMask::repeat(false, signal_count);
@@ -288,24 +312,24 @@ impl<R: BufRead + Seek> FstReader<R> {
             BitMask::repeat(true, signal_count)
         };
         let data_filter = DataFilter {
-            start: filter.start,
-            end: filter.end.unwrap_or(self.meta.header.end_time),
+            start: filter.start,  // min_time
+            end: filter.end.unwrap_or(self.meta.header.end_time),  // target_time
             signals: signal_mask,
         };
 
         // build and run reader
         match &mut self.input {
             InputVariant::Original(input) => {
-                read_pre_start_values(input, &self.meta, &data_filter)
+                read_pre_start_values(input, &self.meta, &data_filter, include_target)
             }
             InputVariant::Incomplete(input, _) => {
-                read_pre_start_values(input, &self.meta, &data_filter)
+                read_pre_start_values(input, &self.meta, &data_filter, include_target)
             }
             InputVariant::UncompressedInMem(input) => {
-                read_pre_start_values(input, &self.meta, &data_filter)
+                read_pre_start_values(input, &self.meta, &data_filter, include_target)
             }
             InputVariant::IncompleteUncompressedInMem(input, _) => {
-                read_pre_start_values(input, &self.meta, &data_filter)
+                read_pre_start_values(input, &self.meta, &data_filter, include_target)
             }
         }
     }
@@ -402,8 +426,8 @@ pub struct TimePointValues {
 /// Holds the first and last signal values in a time range
 #[derive(Debug, Clone)]
 pub struct RangeBoundaryValues {
-    pub first: Option<TimePointValues>,
-    pub last: Option<TimePointValues>,
+    pub first: Option<PreStartValues>,
+    pub last: Option<PreStartValues>,
 }
 
 /// Quickly scans an input to see if it could be a FST file.
@@ -789,6 +813,7 @@ struct PreStartReader<'a, R: Read + Seek> {
     latest_string_values: std::collections::HashMap<usize, (u64, Vec<u8>)>,
     latest_real_values: std::collections::HashMap<usize, (u64, f64)>,
     target_signal_count: usize,
+    include_target: bool,  // 新增：是否包含 target_time 时刻的变化
 }
 
 struct RangeBoundaryReader<'a, R: Read + Seek> {
@@ -999,6 +1024,7 @@ impl<'a, R: Read + Seek> PreStartReader<'a, R> {
         input: &'a mut R,
         meta: &'a MetaData,
         filter: &'a DataFilter,
+        include_target: bool,
     ) -> Self {
         // 计算目标信号数量（统计 BitMask 中被设置的位数）
         let target_signal_count = filter.signals.count_ones();
@@ -1010,6 +1036,7 @@ impl<'a, R: Read + Seek> PreStartReader<'a, R> {
             latest_string_values: std::collections::HashMap::new(),
             latest_real_values: std::collections::HashMap::new(),
             target_signal_count,
+            include_target,
         }
     }
     
@@ -1121,8 +1148,18 @@ impl<'a, R: Read + Seek> PreStartReader<'a, R> {
 
         let mut buffer = Vec::new();
 
+        // 新的参数语义：filter.end 是 target_time
+        let target_time = self.filter.end;
+
         for (time_id, &time) in time_table.iter().enumerate() {
-            if time >= self.filter.start {
+            // 根据 include_target 决定是否包含 target_time 时刻的变化
+            let should_stop = if self.include_target {
+                time > target_time  // 包含 target_time，所以 > 时才停止
+            } else {
+                time >= target_time  // 不包含 target_time，所以 >= 时停止
+            };
+
+            if should_stop {
                 break;
             }
 
@@ -1199,22 +1236,26 @@ impl<'a, R: Read + Seek> PreStartReader<'a, R> {
     }
 
     fn read(mut self) -> Result<PreStartValues> {
-        let target_time = self.filter.start;
+        // 新的参数语义：
+        // - filter.end: target_time（查找 end 之前/包含的最近值）
+        // - filter.start: min_time（跳过 end < start 的块，返回的值必须 >= start）
+        let target_time = self.filter.end;
+        let min_time = self.filter.start;
         let sections = &self.meta.data_sections;
-        
+
         if sections.is_empty() {
             return Ok(PreStartValues {
                 string_values: Vec::new(),
                 real_values: Vec::new(),
             });
         }
-        
+
         // 步骤1：反向查找包含 target_time 的数据块
         // 从最后一个块开始，找到第一个 start_time < target_time 的块
         let start_idx = sections.iter().enumerate().rev().find(|(_, s)| {
             s.start_time < target_time
         }).map(|(idx, _)| idx);
-        
+
         let Some(start_idx) = start_idx else {
             // target_time 之前没有任何数据
             return Ok(PreStartValues {
@@ -1222,20 +1263,26 @@ impl<'a, R: Read + Seek> PreStartReader<'a, R> {
                 real_values: Vec::new(),
             });
         };
-        
+
         // 步骤2：从找到的块开始，反向遍历处理每个块
         // 注意：我们反向遍历块，但在每个块内正向遍历时间点
         for idx in (0..=start_idx).rev() {
             let section = &sections[idx];
-            
+
             // 如果这个块完全在 target_time 之后，跳过
             if section.start_time >= target_time {
                 continue;
             }
-            
+
+            // 如果这个块完全在 min_time 之前，跳过
+            // 这意味着块内所有变化都在 min_time 之前，不需要处理
+            if section.end_time < min_time {
+                continue;
+            }
+
             // 处理这个块
             self.collect_from_section(section, idx == 0)?;
-            
+
             // 检查是否所有信号都找到了，如果是则提前终止
             if self.all_signals_found() {
                 break;
@@ -1265,8 +1312,9 @@ fn read_pre_start_values(
     input: &mut (impl Read + Seek),
     meta: &MetaData,
     filter: &DataFilter,
+    include_target: bool,
 ) -> Result<PreStartValues> {
-    let reader = PreStartReader::new(input, meta, filter);
+    let reader = PreStartReader::new(input, meta, filter, include_target);
     reader.read()
 }
 
@@ -1283,226 +1331,73 @@ impl<'a, R: Read + Seek> RangeBoundaryReader<'a, R> {
         }
     }
 
-    fn find_first_time_point(&mut self) -> Result<Option<TimePointValues>> {
+    /// 查找每个信号在区间 [start, end] 内的第一个变化值
+    fn find_first_in_range(&mut self) -> Result<PreStartValues> {
         let sections = &self.meta.data_sections;
         
-        let first_section_idx = sections.iter().position(|s| {
-            s.end_time >= self.filter.start && s.start_time <= self.filter.end
-        });
+        // 找到与区间 [start, end] 重叠的数据块
+        let relevant_sections: Vec<_> = sections
+            .iter()
+            .filter(|s| self.filter.end >= s.start_time && s.end_time >= self.filter.start)
+            .collect();
 
-        let Some(section_idx) = first_section_idx else {
-            return Ok(None);
-        };
-        let section = &sections[section_idx];
-
-        self.input.seek(SeekFrom::Start(section.file_offset))?;
-        let section_length = read_u64(&mut self.input)?;
-        let start_time = read_u64(&mut self.input)?;
-        let _ = read_u64(&mut self.input)?;
-
-        let (time_section_length, time_table) = read_time_table(
-            &mut self.input,
-            section.file_offset,
-            section_length,
-        )?;
-
-        let is_first_section = section_idx == 0;
-        let should_read_frame = is_first_section && (time_table.is_empty() || time_table[0] > start_time);
-
-        if should_read_frame && start_time >= self.filter.start && start_time <= self.filter.end {
-            return self.collect_frame_values(section, section_length, start_time);
+        if relevant_sections.is_empty() {
+            return Ok(PreStartValues {
+                string_values: Vec::new(),
+                real_values: Vec::new(),
+            });
         }
 
-        // 从 filter.start 开始，向前搜索有信号变化的时间点
-        let start_idx = time_table
-            .binary_search(&self.filter.start)
-            .unwrap_or_else(|x| x);
-
-        for time_idx in start_idx..time_table.len() {
-            let time = time_table[time_idx];
-            if time > self.filter.end {
-                break;
-            }
-            
-            // 尝试收集这个时间点的值
-            if let Some(values) = self.collect_time_point_values(
-                section, 
-                section_length, 
-                time_section_length, 
-                &time_table, 
-                time_idx
-            )? {
-                // 如果收集到了我们关心的信号的值，返回结果
-                if !values.string_values.is_empty() || !values.real_values.is_empty() {
-                    return Ok(Some(values));
-                }
-            }
-        }
-
-        Ok(None)
-    }
-
-    fn collect_frame_values(
-        &mut self,
-        section: &DataSectionInfo,
-        section_length: u64,
-        start_time: u64,
-    ) -> Result<Option<TimePointValues>> {
-        let mut string_values = Vec::new();
-        let mut real_values = Vec::new();
-
-        read_frame(
-            &mut self.input,
-            section.file_offset,
-            section_length,
-            &self.meta.signals,
-            &self.filter.signals,
-            self.meta.float_endian,
-            start_time,
-            &mut |time, handle, value| match value {
-                FstSignalValue::String(bytes) => {
-                    string_values.push(PreStartSignalValue {
-                        handle,
-                        value: bytes.to_vec(),
-                        time,
-                    });
-                }
-                FstSignalValue::Real(value) => {
-                    real_values.push(PreStartRealValue {
-                        handle,
-                        value,
-                        time,
-                    });
-                }
-            },
-        )?;
-
-        if string_values.is_empty() && real_values.is_empty() {
-            Ok(None)
-        } else {
-            Ok(Some(TimePointValues {
-                time: start_time,
-                string_values,
-                real_values,
-            }))
-        }
-    }
-
-    fn find_last_time_point(&mut self) -> Result<Option<TimePointValues>> {
-        let sections = &self.meta.data_sections;
+        let mut first_string_values: std::collections::HashMap<usize, PreStartSignalValue> = 
+            std::collections::HashMap::new();
+        let mut first_real_values: std::collections::HashMap<usize, PreStartRealValue> = 
+            std::collections::HashMap::new();
         
-        let last_section_idx = sections.iter().rposition(|s| {
-            s.start_time <= self.filter.end && s.end_time >= self.filter.start
-        });
+        let target_count = self.filter.signals.count_ones();
 
-        let Some(section_idx) = last_section_idx else {
-            return Ok(None);
-        };
-        let section = &sections[section_idx];
-
-        self.input.seek(SeekFrom::Start(section.file_offset))?;
-        let section_length = read_u64(&mut self.input)?;
-        let _ = read_u64(&mut self.input)?;
-        let _ = read_u64(&mut self.input)?;
-
-        let (time_section_length, time_table) = read_time_table(
-            &mut self.input,
-            section.file_offset,
-            section_length,
-        )?;
-
-        if time_table.is_empty() {
-            return Ok(None);
-        }
-
-        // 从 filter.end 开始，向后搜索有信号变化的时间点
-        let end_idx = time_table
-            .binary_search(&self.filter.end)
-            .unwrap_or_else(|x| x.saturating_sub(1));
-
-        for time_idx in (0..=end_idx).rev() {
-            let time = time_table[time_idx];
-            if time < self.filter.start {
+        // 正向遍历数据块
+        for section in relevant_sections {
+            // 检查是否已经找到所有信号
+            if first_string_values.len() + first_real_values.len() >= target_count {
                 break;
             }
+
+            self.input.seek(SeekFrom::Start(section.file_offset))?;
+            let section_length = read_u64(&mut self.input)?;
+            let _start_time = read_u64(&mut self.input)?;
+            let _ = read_u64(&mut self.input)?;
+
+            let (time_section_length, time_table) = read_time_table(
+                &mut self.input,
+                section.file_offset,
+                section_length,
+            )?;
+
+            // 跳过 Frame，因为我们只找变化值，不包括初始值
+            skip_frame(&mut self.input, section.file_offset)?;
+
+            let (max_handle, _) = read_variant_u64(&mut self.input)?;
+            let vc_start = self.input.stream_position()?;
+            let packtpe = ValueChangePackType::from_u8(read_u8(&mut self.input)?);
+            let chain_len_offset = section.file_offset + section_length - time_section_length - 8;
+            let signal_offsets = read_signal_locs(
+                &mut self.input,
+                chain_len_offset,
+                section.kind,
+                max_handle,
+                vc_start,
+            )?;
+
+            // 检查这个数据块里有没有任何我们需要的信号
+            let has_relevant_signals = signal_offsets.iter().any(|entry| {
+                self.filter.signals.is_set(entry.signal_idx)
+            });
             
-            // 尝试收集这个时间点的值
-            if let Some(values) = self.collect_time_point_values(
-                section, 
-                section_length, 
-                time_section_length, 
-                &time_table, 
-                time_idx
-            )? {
-                // 如果收集到了我们关心的信号的值，返回结果
-                if !values.string_values.is_empty() || !values.real_values.is_empty() {
-                    return Ok(Some(values));
-                }
-            }
-        }
-
-        Ok(None)
-    }
-
-    fn collect_time_point_values(
-        &mut self,
-        section: &DataSectionInfo,
-        section_length: u64,
-        time_section_length: u64,
-        time_table: &[u64],
-        target_time_idx: usize,
-    ) -> Result<Option<TimePointValues>> {
-        skip_frame(&mut self.input, section.file_offset)?;
-
-        let (max_handle, _) = read_variant_u64(&mut self.input)?;
-        let vc_start = self.input.stream_position()?;
-        let packtpe = ValueChangePackType::from_u8(read_u8(&mut self.input)?);
-        let chain_len_offset = section.file_offset + section_length - time_section_length - 8;
-        let signal_offsets = read_signal_locs(
-            &mut self.input,
-            chain_len_offset,
-            section.kind,
-            max_handle,
-            vc_start,
-        )?;
-
-        let mut mu: Vec<u8> = Vec::new();
-        let mut head_pointer = vec![0u32; max_handle as usize];
-        let mut length_remaining = vec![0u32; max_handle as usize];
-        let mut scatter_pointer = vec![0u32; max_handle as usize];
-        let mut tc_head = vec![0u32; std::cmp::max(1, time_table.len())];
-
-        for entry in signal_offsets.iter() {
-            if self.filter.signals.is_set(entry.signal_idx) {
-                self.input.seek(SeekFrom::Start(vc_start + entry.offset))?;
-                let mut bytes =
-                    read_packed_signal_value_bytes(&mut self.input, entry.len, packtpe)?;
-
-                let len = self.meta.signals[entry.signal_idx].len();
-                let tdelta = if len == 1 {
-                    read_one_bit_signal_time_delta(&bytes, 0)?
-                } else {
-                    read_multi_bit_signal_time_delta(&bytes, 0)?
-                };
-
-                head_pointer[entry.signal_idx] = mu.len() as u32;
-                length_remaining[entry.signal_idx] = bytes.len() as u32;
-                mu.append(&mut bytes);
-
-                scatter_pointer[entry.signal_idx] = tc_head[tdelta];
-                tc_head[tdelta] = entry.signal_idx as u32 + 1;
-            }
-        }
-
-        let mut string_values = Vec::new();
-        let mut real_values = Vec::new();
-        let mut buffer = Vec::new();
-
-        for (time_id, &time) in time_table.iter().enumerate() {
-            if time_id > target_time_idx {
-                break;
+            if !has_relevant_signals {
+                continue;
             }
 
+            // 对于每个信号，沿着变化链遍历，找到第一个在 [start, end] 范围内的变化
             let eof_error = || {
                 ReaderError::Io(std::io::Error::new(
                     std::io::ErrorKind::UnexpectedEof,
@@ -1510,123 +1405,229 @@ impl<'a, R: Read + Seek> RangeBoundaryReader<'a, R> {
                 ))
             };
 
-            while tc_head[time_id] != 0 {
-                let signal_id = (tc_head[time_id] - 1) as usize;
-                let mut mu_slice = &mu.as_slice()[head_pointer[signal_id] as usize..];
-                let (vli, skiplen) = read_variant_u32(&mut mu_slice)?;
-                let signal_len = self.meta.signals[signal_id].len();
-                let signal_handle = FstSignalHandle::from_index(signal_id);
+            for entry in signal_offsets.iter() {
+                // 检查是否已经找到所有信号
+                if first_string_values.len() + first_real_values.len() >= target_count {
+                    break;
+                }
 
-                let len = if time_id == target_time_idx {
-                    match signal_len {
-                        1 => {
-                            let value = one_bit_signal_value_to_char(vli);
-                            string_values.push(PreStartSignalValue {
-                                handle: signal_handle,
-                                value: vec![value],
-                                time,
-                            });
-                            0
-                        }
-                        0 => {
-                            let (len, skiplen2) = read_variant_u32(&mut mu_slice)?;
-                            let value = mu_slice.get(..len as usize).ok_or_else(eof_error)?.to_vec();
-                            string_values.push(PreStartSignalValue {
-                                handle: signal_handle,
-                                value,
-                                time,
-                            });
-                            len + skiplen2
-                        }
-                        len => {
-                            if !self.meta.signals[signal_id].is_real() {
-                                let signal_len_usize = len as usize;
-                                let (value_bytes, len_val) = if (vli & 1) == 0 {
-                                    let read_len = signal_len_usize.div_ceil(8);
-                                    let bytes = mu_slice.get(..read_len).ok_or_else(eof_error)?;
-                                    multi_bit_digital_signal_to_chars(bytes, signal_len_usize, &mut buffer);
-                                    (buffer.clone(), read_len as u32)
-                                } else {
-                                    let value = mu_slice.get(..signal_len_usize).ok_or_else(eof_error)?.to_vec();
-                                    (value, len)
-                                };
-                                string_values.push(PreStartSignalValue {
-                                    handle: signal_handle,
-                                    value: value_bytes,
-                                    time,
-                                });
-                                len_val
-                            } else {
-                                assert_eq!(vli & 1, 1);
-                                let value = read_f64(&mut mu_slice, self.meta.float_endian)?;
-                                real_values.push(PreStartRealValue {
-                                    handle: signal_handle,
-                                    value,
-                                    time,
-                                });
-                                8
+                // 如果这个信号不是我们关心的，跳过
+                if !self.filter.signals.is_set(entry.signal_idx) {
+                    continue;
+                }
+
+                // 如果这个信号已经找到了，跳过
+                if first_string_values.contains_key(&entry.signal_idx) || 
+                   first_real_values.contains_key(&entry.signal_idx) {
+                    continue;
+                }
+
+                // 读取信号数据
+                self.input.seek(SeekFrom::Start(vc_start + entry.offset))?;
+                let bytes = read_packed_signal_value_bytes(&mut self.input, entry.len, packtpe)?;
+
+                let signal_len = self.meta.signals[entry.signal_idx].len();
+                let signal_handle = FstSignalHandle::from_index(entry.signal_idx);
+                let is_real = self.meta.signals[entry.signal_idx].is_real();
+
+                // 沿着变化链遍历
+                // 使用与 read_value_changes 相同的方式解析信号数据
+                let mu = bytes.clone();
+                let mut head_pointer: u32 = 0;
+                let mut length_remaining = mu.len() as u32;
+                
+                // 当前时间索引（从第一个时间偏移开始）
+                let mut current_time_idx: usize = 0;
+                
+                while length_remaining > 0 {
+                    // 读取时间偏移 VLI
+                    let mut mu_slice = &mu[head_pointer as usize..];
+                    let (vli, tdelta_skiplen) = read_variant_u32(&mut mu_slice)?;
+                    
+                    // 计算时间偏移
+                    let tdelta = if signal_len == 1 {
+                        let shift_count = 2u32 << (vli & 1);
+                        (vli >> shift_count) as usize
+                    } else {
+                        (vli >> 1) as usize
+                    };
+                    
+                    // 更新当前时间索引
+                    if head_pointer == 0 {
+                        // 第一个变化：tdelta 是绝对索引
+                        current_time_idx = tdelta;
+                    } else {
+                        // 后续变化：tdelta 是相对偏移
+                        current_time_idx += tdelta;
+                    }
+                    
+                    // 跳过时间偏移 VLI
+                    head_pointer += tdelta_skiplen;
+                    length_remaining -= tdelta_skiplen;
+                    
+                    // 检查当前时间是否在 [start, end] 范围内
+                    if current_time_idx < time_table.len() {
+                        let current_time = time_table[current_time_idx];
+                        
+                        if current_time >= self.filter.start && current_time <= self.filter.end {
+                            // 找到了！解析值并记录
+                            let mut mu_slice = &mu[head_pointer as usize..];
+
+                            match signal_len {
+                                1 => {
+                                    // 1位信号：值编码在 VLI 中
+                                    let value = one_bit_signal_value_to_char(vli);
+                                    first_string_values.insert(
+                                        entry.signal_idx,
+                                        PreStartSignalValue {
+                                            handle: signal_handle,
+                                            value: vec![value],
+                                            time: current_time,
+                                        }
+                                    );
+                                    break;
+                                }
+                                0 => {
+                                    // 变长字符串信号
+                                    let (len, len_skiplen) = read_variant_u32(&mut mu_slice)?;
+                                    let value = mu_slice.get(..len as usize).ok_or_else(eof_error)?.to_vec();
+                                    first_string_values.insert(
+                                        entry.signal_idx,
+                                        PreStartSignalValue {
+                                            handle: signal_handle,
+                                            value,
+                                            time: current_time,
+                                        }
+                                    );
+                                    break;
+                                }
+                                len => {
+                                    if !is_real {
+                                        // 多位数字信号
+                                        let signal_len_usize = len as usize;
+                                        let mut buffer = Vec::new();
+                                        let value_bytes = if (vli & 1) == 0 {
+                                            // 2-state: 读取压缩的字节数据
+                                            let read_len = signal_len_usize.div_ceil(8);
+                                            let bytes = mu_slice.get(..read_len).ok_or_else(eof_error)?;
+                                            multi_bit_digital_signal_to_chars(bytes, signal_len_usize, &mut buffer);
+                                            buffer
+                                        } else {
+                                            // 4-state: 直接读取字符串
+                                            mu_slice.get(..signal_len_usize).ok_or_else(eof_error)?.to_vec()
+                                        };
+                                        first_string_values.insert(
+                                            entry.signal_idx,
+                                            PreStartSignalValue {
+                                                handle: signal_handle,
+                                                value: value_bytes,
+                                                time: current_time,
+                                            }
+                                        );
+                                        break;
+                                    } else {
+                                        // 实数信号
+                                        assert_eq!(vli & 1, 1, "TODO: implement support for rare packed case");
+                                        let value = read_f64(&mut mu_slice, self.meta.float_endian)?;
+                                        first_real_values.insert(
+                                            entry.signal_idx,
+                                            PreStartRealValue {
+                                                handle: signal_handle,
+                                                value,
+                                                time: current_time,
+                                            }
+                                        );
+                                        break;
+                                    }
+                                }
                             }
                         }
                     }
-                } else {
-                    match signal_len {
-                        1 => 0,
+
+                    // 移动到下一个变化：跳过当前值数据
+                    let value_len = match signal_len {
+                        1 => 0, // 1位信号：值在 VLI 中，没有额外数据
                         0 => {
-                            let (len, _) = read_variant_u32(&mut mu_slice)?;
-                            len
+                            // 变长字符串：需要读取长度
+                            let mut mu_slice = &mu[head_pointer as usize..];
+                            let (len, len_skiplen) = read_variant_u32(&mut mu_slice)?;
+                            len + len_skiplen
                         }
                         len => {
-                            if !self.meta.signals[signal_id].is_real() {
+                            if !is_real {
+                                // 多位数字信号
                                 if (vli & 1) == 0 {
+                                    // 2-state
                                     (len as usize).div_ceil(8) as u32
                                 } else {
+                                    // 4-state
                                     len
                                 }
                             } else {
+                                // 实数信号
                                 8
                             }
                         }
-                    }
-                };
-
-                let total_skiplen = skiplen + len;
-                head_pointer[signal_id] += total_skiplen;
-                length_remaining[signal_id] -= total_skiplen;
-
-                tc_head[time_id] = scatter_pointer[signal_id];
-                scatter_pointer[signal_id] = 0;
-
-                if length_remaining[signal_id] > 0 {
-                    let tdelta = if signal_len == 1 {
-                        read_one_bit_signal_time_delta(&mu, head_pointer[signal_id])?
-                    } else {
-                        read_multi_bit_signal_time_delta(&mu, head_pointer[signal_id])?
                     };
 
-                    scatter_pointer[signal_id] = tc_head[time_id + tdelta];
-                    tc_head[time_id + tdelta] = (signal_id + 1) as u32;
+                    head_pointer += value_len;
+                    length_remaining -= value_len;
                 }
             }
         }
 
-        if string_values.is_empty() && real_values.is_empty() {
-            Ok(None)
-        } else {
-            Ok(Some(TimePointValues {
-                time: time_table[target_time_idx],
-                string_values,
-                real_values,
-            }))
-        }
+        let string_values: Vec<_> = first_string_values.into_values().collect();
+        let real_values: Vec<_> = first_real_values.into_values().collect();
+
+        Ok(PreStartValues {
+            string_values,
+            real_values,
+        })
     }
 
     fn read(mut self) -> Result<RangeBoundaryValues> {
-        let first = self.find_first_time_point()?;
+        // 查找 first：每个信号在区间内的第一个变化
+        let first = self.find_first_in_range()?;
         
+        // 查找 last：复用 read_pre_start_values
+        // 新的参数语义：start = min_time（区间开始），end = target_time（区间结束）
+        // 函数会跳过 end < start 的块，并返回在 [start, end] 区间内的最近值
         self.input.seek(SeekFrom::Start(0))?;
-        let last = self.find_last_time_point()?;
+
+        // 获取每个信号在 [start, end] 区间内的最近值（包含 end）
+        let end_values = read_pre_start_values(
+            &mut self.input,
+            &self.meta,
+            &DataFilter {
+                start: self.filter.start,  // min_time：跳过 end < start 的块
+                end: self.filter.end,      // target_time：查找 end 之前的最近值
+                signals: self.filter.signals.clone(),
+            },
+            true,  // 包含 end
+        )?;
+
+        // 由于 read_pre_start_values 已经跳过了 end < start 的块
+        // 返回的值应该都在 [start, end] 区间内，不需要额外过滤
+        let last_string_values = end_values.string_values;
+        let last_real_values = end_values.real_values;
         
-        Ok(RangeBoundaryValues { first, last })
+        let last = if last_string_values.is_empty() && last_real_values.is_empty() {
+            None
+        } else {
+            Some(PreStartValues {
+                string_values: last_string_values,
+                real_values: last_real_values,
+            })
+        };
+        
+        Ok(RangeBoundaryValues { 
+            first: if first.string_values.is_empty() && first.real_values.is_empty() {
+                None
+            } else {
+                Some(first)
+            }, 
+            last 
+        })
     }
 }
 

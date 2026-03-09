@@ -486,7 +486,7 @@ DataReader::read_value_changes()  ← 这是核心处理代码！
 ### 9.1 需求定义
 
 我们需要实现一个独立函数，接口类似 `read_signals`，但是：
-- 只返回 `filter.start` 之前的**最新值**
+- 只回调 `filter.start` 之前的**最新值**
 - 或者说，`start` 之前最近的一个 transition 的值
 - 高效，参考 `read_signals` 的实现
 
@@ -495,21 +495,29 @@ DataReader::read_value_changes()  ← 这是核心处理代码！
 #### 设计原则
 
 1. **借鉴但不复制**：复用数据读取和解码逻辑，但重新设计流程
-2. **正向遍历 + HashMap 追踪**：正向遍历数据块和时间点，用 HashMap 记录每个信号的最新值
+2. **反向遍历**：从最新数据块开始找，而不是从最旧的开始
 3. **状态追踪**：为每个信号记录最新值，而不是边处理边回调
-4. **简单可靠**：实现简单，避免复杂的反向遍历逻辑
+4. **提前终止**：所有信号找到值后立即停止，不用读完所有数据
 
 #### 核心数据结构
 
 ```rust
-struct PreStartReader<'a, R: Read + Seek> {
+struct SignalState {
+    has_value: bool,
+    time: u64,
+    value: Vec<u8>,      // 存储数字信号值
+    real_value: f64,     // 存储浮点信号值
+    is_real: bool,
+}
+
+struct PreStartValueReader<'a, R: Read + Seek> {
     input: &'a mut R,
     meta: &'a MetaData,
     filter: &'a DataFilter,
-    // 记录每个信号的最新值（字符串/位向量类型）
-    latest_string_values: HashMap<usize, (u64, Vec<u8>)>,
-    // 记录每个信号的最新值（浮点类型）
-    latest_real_values: HashMap<usize, (u64, f64)>,
+    // 新增：追踪每个信号的最新值
+    signal_states: Vec<Option<SignalState>>,
+    signals_found: usize,
+    target_time: u64,
 }
 ```
 
@@ -522,25 +530,27 @@ struct PreStartReader<'a, R: Read + Seek> {
 输出：每个信号在 target_time 之前的最新值
 
 1. 构建 BitMask，标识哪些信号需要查找
-2. 初始化 HashMap 用于记录每个信号的最新值
+2. 初始化 signal_states 数组
+3. 计算需要查找的信号总数
 ```
 
-#### 阶段 2：正向遍历数据块
+#### 阶段 2：反向遍历数据块
 
 ```
-// 只处理与 [0, target_time) 有重叠的数据块
-let relevant_sections = sections
-    .iter()
-    .filter(|s| s.end_time < target_time)  // 完全在之前的块
-    .chain(
-        sections.iter().filter(|s| {
-            s.start_time < target_time && s.end_time >= target_time
-        })  // 包含 target_time 的块
-    );
-
-for section in relevant_sections {
+for section in meta.data_sections.iter().rev() {  // ← 反向！从最新的开始
+    
+    // 快速跳过：如果这个块完全在 target_time 之后，且所有信号还没找到值
+    if section.start_time > target_time && signals_found < total_signals {
+        continue;
+    }
+    
     // 处理这个数据块
     process_section(section);
+    
+    // 提前终止：所有信号都找到了！
+    if signals_found >= total_signals {
+        break;
+    }
 }
 ```
 
@@ -551,45 +561,61 @@ for section in relevant_sections {
 ```
 function process_section(section):
     
-    // 3.1 读取初始帧（如果是第一个块）
-    if is_first_section && has_frame {
-        read_frame_and_update_hashmaps()
-    }
-    
-    // 3.2 读取时间戳表
+    // 3.1 借鉴：读取时间戳表
     time_table = read_time_table(...)
     
-    // 3.3 读取信号位置表
+    // 3.2 借鉴：读取信号位置表
     signal_offsets = read_signal_locs(...)
     
-    // 3.4 读取信号数据到内存，建立时间轮
+    // 3.3 借鉴：读取信号数据到内存，建立时间轮
+    // 这部分完全复用 read_value_changes 的 678-702 行
     mu, head_pointer, length_remaining, tc_head = build_time_wheel(signal_offsets)
     
-    // 3.5 正向遍历时间点，直到遇到 >= target_time 的时间
-    for (time_id, time) in time_table.iter().enumerate() {
+    // 3.4 修改：反向遍历时间点！
+    for (time_id, time) in time_table.iter().enumerate().rev() {
         
-        // 遇到 >= target_time 的时间，停止
-        if time >= target_time {
-            break;
+        // 跳过：这个时间点在 target_time 之后
+        if *time > target_time {
+            continue;
         }
         
-        // 3.6 处理这个时间点的信号，更新 HashMap
+        // 3.5 修改：处理这个时间点的信号，但更新 signal_states，而不是回调
         while tc_head[time_id] != 0 {
             signal_id = (tc_head[time_id] - 1) as usize
             
-            // 读取信号值
-            value = decode_signal_value(signal_id, ...)
-            
-            // 更新 HashMap（覆盖旧值，只保留最新的）
-            if is_string_signal {
-                latest_string_values.insert(signal_id, (time, value));
-            } else {
-                latest_real_values.insert(signal_id, (time, value));
+            // 如果这个信号还没找到值
+            if !signal_states[signal_id].has_value {
+                
+                // 读取信号值
+                value = decode_signal_value(signal_id, ...)
+                
+                // 更新状态
+                signal_states[signal_id] = SignalState {
+                    has_value: true,
+                    time: *time,
+                    value: value,
+                    ...
+                }
+                
+                signals_found += 1
             }
             
-            // 更新时间轮指针，处理下一个变化点
-            update_time_wheel_pointers();
+            // 关键：我们不需要继续处理这个信号的更早变化！
+            // 因为我们是反向遍历，第一个找到的就是最新的！
+            // 所以不更新时间轮指针到下一个变化点
+            tc_head[time_id] = 0  // ← 直接清零，不处理更早的变化
         }
+        
+        // 3.6 检查：是否所有信号都找到了？
+        if signals_found >= total_signals {
+            return;  // 提前终止！
+        }
+    }
+    
+    // 3.7 如果这个块有 Frame（初始值帧）
+    // 对于还没找到值的信号，检查 Frame
+    if is_first_section_in_reverse && has_frame {
+        read_frame_and_update_states()
     }
 }
 ```
@@ -598,46 +624,29 @@ function process_section(section):
 
 | 优化 | 说明 |
 |------|------|
-| **正向遍历 + HashMap 覆盖** | 正向遍历，HashMap 自动保留最新值，逻辑简单可靠 |
-| **数据块过滤** | 只处理与 [0, target_time) 有重叠的数据块 |
-| **提前终止时间遍历** | 在一个数据块内，遇到 >= target_time 的时间就停止 |
+| **反向遍历数据块** | 从最新的开始，找到值就能早停止 |
+| **反向遍历时间点** | 在一个数据块内也从最新的时间点开始 |
+| **找到就停止** | 一个信号找到最新值后，不再处理它的更早变化 |
+| **提前终止** | 所有信号找到值后，立即停止整个流程 |
 | **复用解码逻辑** | 信号值解码完全复用现有代码 |
-| **空间效率高** | 每个信号在 HashMap 中只占一条记录 |
 
 ### 9.5 时间复杂度分析
 
 | 情况 | 时间复杂度 |
 |------|-----------|
-| 最好情况（要找的时间点很靠前） | O(k) 个数据块，k 很小 |
-| 平均情况 | O(m) 个数据块，m 是到 target_time 的数据块数 |
-| 最坏情况（要找文件末尾） | O(n) 个数据块，n = 总数据块数 |
-
-虽然失去了反向遍历的"提前终止"优化，但在实际使用中：
-- 数据块本身已经有时间范围过滤
-- 用户很少会去查找文件开头很久远的值
-- 实现简单，可靠性高，维护成本低
+| 最好情况（所有信号都在最新块） | O(1) 个数据块 + O(m) 个时间点 |
+| 平均情况 | O(k) 个数据块，k << 总数据块数 |
+| 最坏情况（要找文件开头） | O(n) 个数据块，n = 总数据块数 |
 
 ### 9.6 与 read_signals 的对比
 
-| 特性 | read_signals | read_pre_start_values |
-|------|-------------|-----------------------|
-| 遍历方向 | 正向（旧→新） | 正向（旧→新） |
-| 回调方式 | 每个变化都回调 | 只返回最新值 |
-| 状态追踪 | 无（边处理边回调） | 有（HashMap 记录每个信号最新值） |
-| 提前终止 | 无（处理到 filter.end） | 有（遇到 >= target_time 的时间点就停止） |
-| 实现复杂度 | 中等 | 简单 |
-| 可靠性 | 高 | 更高（逻辑更简单） |
-
-### 9.7 为什么选择正向遍历 + HashMap？
-
-我们最初设计的是反向遍历 + 提前终止的方案，但在实际实现中发现：
-
-1. **反向遍历时间轮的逻辑复杂**：时间轮是为正向遍历设计的，反向遍历需要特殊处理指针，容易出错
-2. **可靠性优先**：正向遍历 + HashMap 的实现更简单直观，不容易引入 bug
-3. **性能损失可接受**：虽然理论上最坏情况需要遍历更多数据，但在实际使用场景中性能差异不明显
-4. **维护成本低**：简单的实现更容易理解和维护
-
-测试结果表明，正向遍历 + HashMap 的实现完全正确，通过了 100 个随机区间的测试！
+| 特性 | read_signals | 我们的新函数 |
+|------|-------------|-------------|
+| 遍历方向 | 正向（旧→新） | 反向（新→旧） |
+| 回调方式 | 每个变化都回调 | 只回调最新值 |
+| 状态追踪 | 无（边处理边回调） | 有（记录每个信号最新值） |
+| 提前终止 | 无（处理到 filter.end） | 有（所有信号找到就停） |
+| 处理 start 之前 | 为了状态正确 | 专门为了找最新值 |
 
 ---
 
@@ -813,9 +822,15 @@ pub fn read_pre_start_values(&mut self, filter: &FstFilter) -> Result<PreStartVa
 ### 参数说明
 
 - `filter: &FstFilter` - 过滤器，包含以下字段：
-  - `start: u64` - 查找的截止时间点（函数会查找在此时间之前发生的最新值）
-  - `end: Option<u64>` - （在本函数中未使用，但为了保持与 `read_signals` 接口一致）
+  - `start: u64` - **最小时间**（min_time）。函数会跳过所有结束时间小于此值的块，返回的信号值时间必须大于等于此值
+  - `end: Option<u64>` - **目标时间**（target_time）。函数会查找在此时间之前（或包含）发生的最新值。如果为 `None`，则使用文件的最大时间
   - `include: Option<Vec<FstSignalHandle>>` - 要查找的信号列表，如果为 `None` 则查找所有信号
+
+**参数语义说明**：
+- 函数查找的是时间区间 `[start, end]` 内的最新值
+- `end` 是查找的目标时间点（包含，取决于实现）
+- `start` 是最小时间限制，用于优化（跳过完全在 `start` 之前的块）
+- 返回的所有值的时间戳 `t` 满足：`start <= t <= end`
 
 ### 返回值
 
@@ -861,10 +876,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let reader = BufReader::new(file);
     let mut fst = FstReader::open(reader)?;
 
+    // 查找时间 1000 之前的最新值
+    // start=0: 不跳过任何块（从文件开头开始查找）
+    // end=Some(1000): 目标时间是 1000
     let filter = FstFilter {
-        start: 1000,
-        end: None,
-        include: None,  // 查找所有信号
+        start: 0,              // min_time: 不跳过任何块
+        end: Some(1000),       // target_time: 查找 1000 之前的最新值
+        include: None,         // 查找所有信号
     };
 
     let pre_start_values = fst.read_pre_start_values(&filter)?;
@@ -904,15 +922,54 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         FstSignalHandle::from_index(10),
     ];
 
+    // 查找时间 500 之前的最新值
+    // start=0: 不跳过任何块
+    // end=Some(500): 目标时间是 500
     let filter = FstFilter {
-        start: 500,
-        end: None,
-        include: Some(signals),  // 只查找指定的信号
+        start: 0,              // min_time: 不跳过任何块
+        end: Some(500),        // target_time: 查找 500 之前的最新值
+        include: Some(signals), // 只查找指定的信号
     };
 
     let pre_start_values = fst.read_pre_start_values(&filter)?;
 
     // 处理结果...
+    Ok(())
+}
+```
+
+#### 示例 3：在指定区间内查找最新值
+
+```rust
+use fst_reader::{FstReader, FstFilter};
+use std::fs::File;
+use std::io::BufReader;
+
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let file = File::open("waveform.fst")?;
+    let reader = BufReader::new(file);
+    let mut fst = FstReader::open(reader)?;
+
+    // 查找区间 [1000, 2000] 内的最新值
+    // start=1000: 跳过结束时间 < 1000 的块
+    // end=Some(2000): 目标时间是 2000
+    // 返回的值的时间戳 t 满足：1000 <= t <= 2000
+    let filter = FstFilter {
+        start: 1000,           // min_time: 跳过结束时间 < 1000 的块
+        end: Some(2000),       // target_time: 查找 2000 之前的最新值
+        include: None,         // 查找所有信号
+    };
+
+    let pre_start_values = fst.read_pre_start_values(&filter)?;
+
+    println!("Found {} values in range [1000, 2000]:", 
+             pre_start_values.string_values.len() + pre_start_values.real_values.len());
+    
+    for val in &pre_start_values.string_values {
+        println!("  Signal {:?} at time {}: {:?}", 
+                 val.handle, val.time, val.value);
+    }
+
     Ok(())
 }
 ```
@@ -936,7 +993,19 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 ### 概述
 
-`read_range_boundary_values` 函数用于高效地查找指定时间范围内的第一个和最后一个信号值。这个函数特别优化了大时间范围的场景，通过二分查找和选择性数据处理，避免了遍历整个时间范围的开销。
+`read_range_boundary_values` 函数用于高效地查找指定时间范围内每个信号的**第一个值**和**最后一个值**。与 `read_pre_start_values` 类似，这个函数为每个信号独立查找，而不是查找统一的时间点。
+
+### 语义定义
+
+| 字段 | 语义 | 查找范围 | 包含边界 |
+|------|------|---------|---------|
+| `first` | 每个信号在区间内的**第一个变化值** | `[start, end]` | 包含 `start` 时刻的变化 |
+| `last` | 每个信号在区间内的**最后一个变化值** | `[start, end]` | 包含 `end` 时刻的变化 |
+
+**重要说明**：
+- 如果信号在区间内**没有变化**，返回 `None`（不包括初始值）
+- 每个信号的时间是**独立的**，可能不同
+- 只返回**实际发生变化的信号**
 
 ### API 定义
 
@@ -947,8 +1016,8 @@ pub fn read_range_boundary_values(&mut self, filter: &FstFilter) -> Result<Range
 ### 参数说明
 
 - `filter: &FstFilter` - 过滤器，包含以下字段：
-  - `start: u64` - 时间范围的起始时间
-  - `end: Option<u64>` - 时间范围的结束时间
+  - `start: u64` - 时间范围的起始时间（包含）
+  - `end: Option<u64>` - 时间范围的结束时间（包含）
   - `include: Option<Vec<FstSignalHandle>>` - 要查找的信号列表，如果为 `None` 则查找所有信号
 
 ### 返回值
@@ -957,27 +1026,32 @@ pub fn read_range_boundary_values(&mut self, filter: &FstFilter) -> Result<Range
 
 ```rust
 pub struct RangeBoundaryValues {
-    pub first: Option<TimePointValues>,
-    pub last: Option<TimePointValues>,
+    pub first: Option<PreStartValues>,
+    pub last: Option<PreStartValues>,
 }
 ```
 
-- `first` - 时间范围内第一个时间点的信号值（如果存在）
-- `last` - 时间范围内最后一个时间点的信号值（如果存在）
+- `first` - 每个信号在区间内的第一个值（如果存在）
+- `last` - 每个信号在区间内的最后一个值（如果存在）
 
-其中 `TimePointValues` 的定义：
+使用 `PreStartValues` 结构，每个信号有自己的时间戳：
 
 ```rust
-pub struct TimePointValues {
-    pub time: u64,
+pub struct PreStartValues {
     pub string_values: Vec<PreStartSignalValue>,
     pub real_values: Vec<PreStartRealValue>,
+}
+
+pub struct PreStartSignalValue {
+    pub handle: FstSignalHandle,
+    pub value: Vec<u8>,
+    pub time: u64,  // 该信号变化的具体时间
 }
 ```
 
 ### 使用示例
 
-#### 示例 1：查找大时间范围的首尾数据
+#### 示例 1：查找大时间范围的边界数据
 
 ```rust
 use fst_reader::{FstReader, FstFilter};
@@ -998,25 +1072,27 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let boundary_values = fst.read_range_boundary_values(&filter)?;
 
-    // 处理第一个时间点的数据
+    // 处理第一个值的数据
     if let Some(first) = &boundary_values.first {
-        println!("First time point at {}", first.time);
-        println!("  String values: {}", first.string_values.len());
-        println!("  Real values: {}", first.real_values.len());
+        println!("First values in range:");
+        for val in &first.string_values {
+            println!("  Signal {:?} at time {}: {:?}", val.handle, val.time, val.value);
+        }
     }
 
-    // 处理最后一个时间点的数据
+    // 处理最后一个值的数据
     if let Some(last) = &boundary_values.last {
-        println!("Last time point at {}", last.time);
-        println!("  String values: {}", last.string_values.len());
-        println!("  Real values: {}", last.real_values.len());
+        println!("Last values in range:");
+        for val in &last.string_values {
+            println!("  Signal {:?} at time {}: {:?}", val.handle, val.time, val.value);
+        }
     }
 
     Ok(())
 }
 ```
 
-#### 示例 2：查找特定信号的首尾数据
+#### 示例 2：查找特定信号的边界数据
 
 ```rust
 use fst_reader::{FstReader, FstFilter, FstSignalHandle};
@@ -1043,14 +1119,22 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let boundary_values = fst.read_range_boundary_values(&filter)?;
 
-    // 比较首尾状态的变化
+    // 比较每个信号的首尾变化
     if let (Some(first), Some(last)) = (&boundary_values.first, &boundary_values.last) {
-        println!("Signal changes from {} to {}", first.time, last.time);
+        println!("Signal changes in range [5000, 50000]:");
         
-        // 可以在这里对比每个信号的变化
-        for (first_val, last_val) in first.string_values.iter().zip(&last.string_values) {
-            if first_val.value != last_val.value {
-                println!("Signal {:?} changed!", first_val.handle);
+        // 对比每个信号的首尾值
+        for first_val in &first.string_values {
+            if let Some(last_val) = last.string_values.iter()
+                .find(|v| v.handle == first_val.handle) {
+                if first_val.value != last_val.value {
+                    println!("Signal {:?} changed from {:?} (at {}) to {:?} (at {})", 
+                        first_val.handle, first_val.value, first_val.time,
+                        last_val.value, last_val.time);
+                } else {
+                    println!("Signal {:?} stayed {:?} (first at {}, last at {})", 
+                        first_val.handle, first_val.value, first_val.time, last_val.time);
+                }
             }
         }
     }
@@ -1079,9 +1163,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 ### 注意事项
 
 1. **适用于大时间范围**：当时间范围跨越很多数据块时，优化效果最明显
-2. **首尾可能相同**：如果时间范围内只有一个时间点，first 和 last 会指向同一个时间点
-3. **可能返回 None**：如果时间范围内没有数据，first 和 last 都可能是 None
-4. **只返回变化的信号**：在目标时间点没有变化的信号不会出现在结果中
+2. **每个信号独立**：first 和 last 中的每个信号有自己的时间戳，可能不同
+3. **可能返回 None**：如果信号在区间内没有变化，该信号不会出现在结果中
+4. **只返回变化的信号**：区间内没有变化的信号不会出现在结果中（不包括初始值）
+5. **与 `read_pre_start_values` 的区别**：
+   - `read_pre_start_values`：找 `start` 之前的最新值（包含初始值）
+   - `read_range_boundary_values`：找区间内的第一个/最后一个变化（不包含初始值）
 
 ### 与 read_signals 的性能对比
 
