@@ -1313,20 +1313,33 @@ impl<'a, R: Read + Seek> RangeBoundaryReader<'a, R> {
             return self.collect_frame_values(section, section_length, start_time);
         }
 
-        let first_time_idx = time_table
+        // 从 filter.start 开始，向前搜索有信号变化的时间点
+        let start_idx = time_table
             .binary_search(&self.filter.start)
             .unwrap_or_else(|x| x);
 
-        if first_time_idx >= time_table.len() {
-            return Ok(None);
+        for time_idx in start_idx..time_table.len() {
+            let time = time_table[time_idx];
+            if time > self.filter.end {
+                break;
+            }
+            
+            // 尝试收集这个时间点的值
+            if let Some(values) = self.collect_time_point_values(
+                section, 
+                section_length, 
+                time_section_length, 
+                &time_table, 
+                time_idx
+            )? {
+                // 如果收集到了我们关心的信号的值，返回结果
+                if !values.string_values.is_empty() || !values.real_values.is_empty() {
+                    return Ok(Some(values));
+                }
+            }
         }
 
-        let first_time = time_table[first_time_idx];
-        if first_time > self.filter.end {
-            return Ok(None);
-        }
-
-        self.collect_time_point_values(section, section_length, time_section_length, &time_table, first_time_idx)
+        Ok(None)
     }
 
     fn collect_frame_values(
@@ -1402,20 +1415,33 @@ impl<'a, R: Read + Seek> RangeBoundaryReader<'a, R> {
             return Ok(None);
         }
 
-        let last_time_idx = time_table
+        // 从 filter.end 开始，向后搜索有信号变化的时间点
+        let end_idx = time_table
             .binary_search(&self.filter.end)
             .unwrap_or_else(|x| x.saturating_sub(1));
 
-        if last_time_idx >= time_table.len() {
-            return Ok(None);
+        for time_idx in (0..=end_idx).rev() {
+            let time = time_table[time_idx];
+            if time < self.filter.start {
+                break;
+            }
+            
+            // 尝试收集这个时间点的值
+            if let Some(values) = self.collect_time_point_values(
+                section, 
+                section_length, 
+                time_section_length, 
+                &time_table, 
+                time_idx
+            )? {
+                // 如果收集到了我们关心的信号的值，返回结果
+                if !values.string_values.is_empty() || !values.real_values.is_empty() {
+                    return Ok(Some(values));
+                }
+            }
         }
 
-        let last_time = time_table[last_time_idx];
-        if last_time < self.filter.start {
-            return Ok(None);
-        }
-
-        self.collect_time_point_values(section, section_length, time_section_length, &time_table, last_time_idx)
+        Ok(None)
     }
 
     fn collect_time_point_values(
