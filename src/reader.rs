@@ -493,6 +493,7 @@ fn read_signals(
         meta,
         filter,
         callback: &mut callback,
+        read_frame_data: false,  // read_signals 不需要 frame 数据（初始值）
     };
     reader.read()
 }
@@ -804,6 +805,7 @@ struct DataReader<'a, R: Read + Seek, F: FnMut(u64, FstSignalHandle, FstSignalVa
     meta: &'a MetaData,
     filter: &'a DataFilter,
     callback: &'a mut F,
+    read_frame_data: bool,  // 是否读取 frame 数据（初始值）
 }
 
 struct PreStartReader<'a, R: Read + Seek> {
@@ -873,16 +875,20 @@ impl<R: Read + Seek, F: FnMut(u64, FstSignalHandle, FstSignalValue)> DataReader<
                 mu.append(&mut bytes);
 
                 // remember at what time step we will read this signal
-                scatter_pointer[entry.signal_idx] = tc_head[tdelta];
-                tc_head[tdelta] = entry.signal_idx as u32 + 1; // index to handle
+                if tdelta < tc_head.len() {
+                    scatter_pointer[entry.signal_idx] = tc_head[tdelta];
+                    tc_head[tdelta] = entry.signal_idx as u32 + 1; // index to handle
+                }
             }
         }
 
         let mut buffer = Vec::new();
 
         for (time_id, time) in time_table.iter().enumerate() {
-            // while we cannot ignore signal changes before the start of the window
-            // (since the signal might retain values for multiple cycles),
+            // skip times before the start of the window
+            if *time < self.filter.start {
+                continue;
+            }
             // signal changes after our window are completely useless
             if *time > self.filter.end {
                 break;
@@ -970,10 +976,12 @@ impl<R: Read + Seek, F: FnMut(u64, FstSignalHandle, FstSignalValue)> DataReader<
     fn read(&mut self) -> Result<()> {
         let sections = self.meta.data_sections.clone();
         // filter out any sections which are not in our time window
-        let relevant_sections = sections
+        let relevant_sections: Vec<_> = sections
             .iter()
-            .filter(|s| self.filter.end >= s.start_time && s.end_time >= self.filter.start);
-        for (sec_num, section) in relevant_sections.enumerate() {
+            .filter(|s| self.filter.end >= s.start_time && s.end_time >= self.filter.start)
+            .collect();
+        
+        for (sec_num, section) in relevant_sections.iter().enumerate() {
             // skip to section
             self.input.seek(SeekFrom::Start(section.file_offset))?;
             let section_length = read_u64(&mut self.input)?;
@@ -990,8 +998,8 @@ impl<R: Read + Seek, F: FnMut(u64, FstSignalHandle, FstSignalValue)> DataReader<
                 read_time_table(&mut self.input, section.file_offset, section_length)?;
 
             // only read frame if this is the first section and there is no other data for
-            // the start time
-            if is_first_section && (time_table.is_empty() || time_table[0] > start_time) {
+            // the start time, and if we are configured to read frame data
+            if self.read_frame_data && is_first_section && (time_table.is_empty() || time_table[0] > start_time) {
                 read_frame(
                     &mut self.input,
                     section.file_offset,
