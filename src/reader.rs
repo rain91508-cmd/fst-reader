@@ -334,6 +334,64 @@ impl<R: BufRead + Seek> FstReader<R> {
         }
     }
 
+    /// Read all signal values within a specified time range.
+    ///
+    /// This is a wrapper around `read_signals` that automatically expands the filter
+    /// range to include entire sections, then filters out transitions outside the
+    /// original range.
+    ///
+    /// This function solves the problem where `read_signals` cannot find transitions
+    /// in the filter range because `tc_head` only tracks the first occurrence of each signal.
+    ///
+    /// # How it works
+    /// 1. Finds all sections that overlap with the filter range
+    /// 2. Expands the filter to cover entire sections
+    /// 3. Uses `read_signals` to read all transitions in expanded range
+    /// 4. Filters out transitions outside the original filter range
+    ///
+    /// # Performance
+    /// This function reads entire sections, so it may read more data than necessary.
+    /// For large files, consider using `read_range_boundary_values` instead.
+    pub fn read_signals_in_range(
+        &mut self,
+        filter: &FstFilter,
+        mut callback: impl FnMut(u64, FstSignalHandle, FstSignalValue),
+    ) -> Result<()> {
+        // Store original filter bounds for later filtering
+        let original_start = filter.start;
+        let original_end = filter.end.unwrap_or(self.meta.header.end_time);
+
+        // Find sections that overlap with the filter range
+        let sections = &self.meta.data_sections;
+        let relevant_sections: Vec<_> = sections
+            .iter()
+            .filter(|s| original_end >= s.start_time && s.end_time >= original_start)
+            .collect();
+
+        if relevant_sections.is_empty() {
+            return Ok(());
+        }
+
+        // Calculate expanded range to cover entire sections
+        let expanded_start = relevant_sections.iter().map(|s| s.start_time).min().unwrap_or(0);
+        let expanded_end = relevant_sections.iter().map(|s| s.end_time).max().unwrap_or(self.meta.header.end_time);
+
+        // Create expanded filter
+        let expanded_filter = FstFilter {
+            start: expanded_start,
+            end: Some(expanded_end),
+            include: filter.include.clone(),
+        };
+
+        // Use read_signals with expanded range, then filter results
+        self.read_signals(&expanded_filter, |time, handle, value| {
+            // Only call callback for transitions within original filter range
+            if time >= original_start && time <= original_end {
+                callback(time, handle, value);
+            }
+        })
+    }
+
     /// Read the first and last signal values within a specified time range.
     /// 
     /// This function efficiently finds the first and last time points within
