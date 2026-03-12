@@ -334,6 +334,64 @@ impl<R: BufRead + Seek> FstReader<R> {
         }
     }
 
+    /// Read all signal values within a specified time range.
+    ///
+    /// This is a wrapper around `read_signals` that automatically expands the filter
+    /// range to include entire sections, then filters out transitions outside the
+    /// original range.
+    ///
+    /// This function solves the problem where `read_signals` cannot find transitions
+    /// in the filter range because `tc_head` only tracks the first occurrence of each signal.
+    ///
+    /// # How it works
+    /// 1. Finds all sections that overlap with the filter range
+    /// 2. Expands the filter to cover entire sections
+    /// 3. Uses `read_signals` to read all transitions in expanded range
+    /// 4. Filters out transitions outside the original filter range
+    ///
+    /// # Performance
+    /// This function reads entire sections, so it may read more data than necessary.
+    /// For large files, consider using `read_range_boundary_values` instead.
+    pub fn read_signals_in_range(
+        &mut self,
+        filter: &FstFilter,
+        mut callback: impl FnMut(u64, FstSignalHandle, FstSignalValue),
+    ) -> Result<()> {
+        // Store original filter bounds for later filtering
+        let original_start = filter.start;
+        let original_end = filter.end.unwrap_or(self.meta.header.end_time);
+
+        // Find sections that overlap with the filter range
+        let sections = &self.meta.data_sections;
+        let relevant_sections: Vec<_> = sections
+            .iter()
+            .filter(|s| original_end >= s.start_time && s.end_time >= original_start)
+            .collect();
+
+        if relevant_sections.is_empty() {
+            return Ok(());
+        }
+
+        // Calculate expanded range to cover entire sections
+        let expanded_start = relevant_sections.iter().map(|s| s.start_time).min().unwrap_or(0);
+        let expanded_end = relevant_sections.iter().map(|s| s.end_time).max().unwrap_or(self.meta.header.end_time);
+
+        // Create expanded filter
+        let expanded_filter = FstFilter {
+            start: expanded_start,
+            end: Some(expanded_end),
+            include: filter.include.clone(),
+        };
+
+        // Use read_signals with expanded range, then filter results
+        self.read_signals(&expanded_filter, |time, handle, value| {
+            // Only call callback for transitions within original filter range
+            if time >= original_start && time <= original_end {
+                callback(time, handle, value);
+            }
+        })
+    }
+
     /// Read the first and last signal values within a specified time range.
     /// 
     /// This function efficiently finds the first and last time points within
@@ -493,6 +551,7 @@ fn read_signals(
         meta,
         filter,
         callback: &mut callback,
+        read_frame_data: false,  // read_signals 不需要 frame 数据（初始值）
     };
     reader.read()
 }
@@ -804,6 +863,7 @@ struct DataReader<'a, R: Read + Seek, F: FnMut(u64, FstSignalHandle, FstSignalVa
     meta: &'a MetaData,
     filter: &'a DataFilter,
     callback: &'a mut F,
+    read_frame_data: bool,  // 是否读取 frame 数据（初始值）
 }
 
 struct PreStartReader<'a, R: Read + Seek> {
@@ -873,16 +933,20 @@ impl<R: Read + Seek, F: FnMut(u64, FstSignalHandle, FstSignalValue)> DataReader<
                 mu.append(&mut bytes);
 
                 // remember at what time step we will read this signal
-                scatter_pointer[entry.signal_idx] = tc_head[tdelta];
-                tc_head[tdelta] = entry.signal_idx as u32 + 1; // index to handle
+                if tdelta < tc_head.len() {
+                    scatter_pointer[entry.signal_idx] = tc_head[tdelta];
+                    tc_head[tdelta] = entry.signal_idx as u32 + 1; // index to handle
+                }
             }
         }
 
         let mut buffer = Vec::new();
 
         for (time_id, time) in time_table.iter().enumerate() {
-            // while we cannot ignore signal changes before the start of the window
-            // (since the signal might retain values for multiple cycles),
+            // skip times before the start of the window
+            if *time < self.filter.start {
+                continue;
+            }
             // signal changes after our window are completely useless
             if *time > self.filter.end {
                 break;
@@ -970,10 +1034,12 @@ impl<R: Read + Seek, F: FnMut(u64, FstSignalHandle, FstSignalValue)> DataReader<
     fn read(&mut self) -> Result<()> {
         let sections = self.meta.data_sections.clone();
         // filter out any sections which are not in our time window
-        let relevant_sections = sections
+        let relevant_sections: Vec<_> = sections
             .iter()
-            .filter(|s| self.filter.end >= s.start_time && s.end_time >= self.filter.start);
-        for (sec_num, section) in relevant_sections.enumerate() {
+            .filter(|s| self.filter.end >= s.start_time && s.end_time >= self.filter.start)
+            .collect();
+        
+        for (sec_num, section) in relevant_sections.iter().enumerate() {
             // skip to section
             self.input.seek(SeekFrom::Start(section.file_offset))?;
             let section_length = read_u64(&mut self.input)?;
@@ -990,8 +1056,8 @@ impl<R: Read + Seek, F: FnMut(u64, FstSignalHandle, FstSignalValue)> DataReader<
                 read_time_table(&mut self.input, section.file_offset, section_length)?;
 
             // only read frame if this is the first section and there is no other data for
-            // the start time
-            if is_first_section && (time_table.is_empty() || time_table[0] > start_time) {
+            // the start time, and if we are configured to read frame data
+            if self.read_frame_data && is_first_section && (time_table.is_empty() || time_table[0] > start_time) {
                 read_frame(
                     &mut self.input,
                     section.file_offset,
