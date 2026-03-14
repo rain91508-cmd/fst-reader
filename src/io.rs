@@ -1500,6 +1500,238 @@ pub(crate) fn read_signal_locs(
     }
 }
 
+/// Optimized function to check if a specific signal's loc is None
+/// without building the entire offset table
+pub(crate) fn check_signal_loc_is_none(
+    input: &mut (impl Read + Seek),
+    chain_len_offset: u64,
+    section_kind: DataSectionKind,
+    max_handle: u64,
+    target_signal_idx: usize,
+) -> ReadResult<bool> {
+    input.seek(SeekFrom::Start(chain_len_offset))?;
+    let chain_compressed_length = read_u64(input)?;
+
+    // the chain starts _chain_length_ bytes before the chain length
+    let chain_start = chain_len_offset - chain_compressed_length;
+    input.seek(SeekFrom::Start(chain_start))?;
+    let chain_bytes = read_bytes(input, chain_compressed_length as usize)?;
+
+    if section_kind == DataSectionKind::DynamicAlias2 {
+        check_signal_loc_is_none_dynamic_alias2(&chain_bytes, max_handle, target_signal_idx)
+    } else {
+        check_signal_loc_is_none_dynamic_alias(&chain_bytes, max_handle, target_signal_idx)
+    }
+}
+
+/// Optimized function to check if any of the target signals has non-None loc
+/// without building the entire offset table
+pub(crate) fn check_any_signal_loc_non_none(
+    input: &mut (impl Read + Seek),
+    chain_len_offset: u64,
+    section_kind: DataSectionKind,
+    max_handle: u64,
+    target_mask: &BitMask,
+) -> ReadResult<bool> {
+    input.seek(SeekFrom::Start(chain_len_offset))?;
+    let chain_compressed_length = read_u64(input)?;
+
+    // the chain starts _chain_length_ bytes before the chain length
+    let chain_start = chain_len_offset - chain_compressed_length;
+    input.seek(SeekFrom::Start(chain_start))?;
+    let chain_bytes = read_bytes(input, chain_compressed_length as usize)?;
+
+    if section_kind == DataSectionKind::DynamicAlias2 {
+        check_any_signal_loc_non_none_dynamic_alias2(&chain_bytes, max_handle, target_mask)
+    } else {
+        check_any_signal_loc_non_none_dynamic_alias(&chain_bytes, max_handle, target_mask)
+    }
+}
+
+/// Check if a specific signal's loc is None for DynamicAlias format
+fn check_signal_loc_is_none_dynamic_alias(
+    mut chain_bytes: &[u8],
+    max_handle: u64,
+    target_signal_idx: usize,
+) -> ReadResult<bool> {
+    let mut idx = 0_usize;
+    
+    while !chain_bytes.is_empty() && idx <= target_signal_idx {
+        let (raw_val, _) = read_variant_u32(&mut chain_bytes)?;
+        
+        if raw_val == 0 {
+            // Alias entry - not None
+            if idx == target_signal_idx {
+                return Ok(false);
+            }
+            let (_, _) = read_variant_u32(&mut chain_bytes)?;
+            idx += 1;
+        } else if (raw_val & 1) == 1 {
+            // Offset entry - not None
+            if idx == target_signal_idx {
+                return Ok(false);
+            }
+            idx += 1;
+        } else {
+            // Block of None entries
+            let zeros = raw_val >> 1;
+            let skip_zeros = zeros as usize;
+            
+            if idx + skip_zeros > target_signal_idx {
+                // Target is within this block of zeros
+                return Ok(true);
+            }
+            idx += skip_zeros;
+        }
+    }
+    
+    Ok(idx <= target_signal_idx)
+}
+
+/// Check if a specific signal's loc is None for DynamicAlias2 format
+fn check_signal_loc_is_none_dynamic_alias2(
+    mut chain_bytes: &[u8],
+    max_handle: u64,
+    target_signal_idx: usize,
+) -> ReadResult<bool> {
+    let mut idx = 0_usize;
+    
+    while !chain_bytes.is_empty() && idx <= target_signal_idx {
+        let kind = chain_bytes[0];
+        
+        if (kind & 1) == 1 {
+            let shval = read_variant_i64(&mut chain_bytes)? >> 1;
+            
+            match shval.cmp(&0) {
+                Ordering::Greater => {
+                    // Offset entry - not None
+                    if idx == target_signal_idx {
+                        return Ok(false);
+                    }
+                    idx += 1;
+                }
+                Ordering::Less | Ordering::Equal => {
+                    // Alias entry - not None
+                    if idx == target_signal_idx {
+                        return Ok(false);
+                    }
+                    idx += 1;
+                }
+            }
+        } else {
+            // Block of None entries
+            let (value, _) = read_variant_u32(&mut chain_bytes)?;
+            let zeros = value >> 1;
+            let skip_zeros = zeros as usize;
+            
+            if idx + skip_zeros > target_signal_idx {
+                // Target is within this block of zeros
+                return Ok(true);
+            }
+            idx += skip_zeros;
+        }
+    }
+    
+    Ok(idx <= target_signal_idx)
+}
+
+/// Check if any of the target signals has non-None loc for DynamicAlias format
+fn check_any_signal_loc_non_none_dynamic_alias(
+    mut chain_bytes: &[u8],
+    max_handle: u64,
+    target_mask: &BitMask,
+) -> ReadResult<bool> {
+    let mut idx = 0_usize;
+    let max_idx = max_handle as usize;
+    
+    while !chain_bytes.is_empty() && idx < max_idx {
+        let (raw_val, _) = read_variant_u32(&mut chain_bytes)?;
+        
+        if raw_val == 0 {
+            // Alias entry - not None
+            if idx < max_idx && target_mask.is_set(idx) {
+                return Ok(true);
+            }
+            let (_, _) = read_variant_u32(&mut chain_bytes)?;
+            idx += 1;
+        } else if (raw_val & 1) == 1 {
+            // Offset entry - not None
+            if idx < max_idx && target_mask.is_set(idx) {
+                return Ok(true);
+            }
+            idx += 1;
+        } else {
+            // Block of None entries
+            let zeros = raw_val >> 1;
+            let skip_zeros = zeros as usize;
+            
+            let end_idx = std::cmp::min(idx + skip_zeros, max_idx);
+            // Check if any signal in this block is in target_mask
+            for check_idx in idx..end_idx {
+                if target_mask.is_set(check_idx) {
+                    // We have a target signal in this None block - skip, but keep checking
+                    // the signal itself is None, but maybe others later
+                }
+            }
+            idx = end_idx;
+        }
+    }
+    
+    Ok(false)
+}
+
+/// Check if any of the target signals has non-None loc for DynamicAlias2 format
+fn check_any_signal_loc_non_none_dynamic_alias2(
+    mut chain_bytes: &[u8],
+    max_handle: u64,
+    target_mask: &BitMask,
+) -> ReadResult<bool> {
+    let mut idx = 0_usize;
+    let max_idx = max_handle as usize;
+    
+    while !chain_bytes.is_empty() && idx < max_idx {
+        let kind = chain_bytes[0];
+        
+        if (kind & 1) == 1 {
+            let shval = read_variant_i64(&mut chain_bytes)? >> 1;
+            
+            match shval.cmp(&0) {
+                Ordering::Greater => {
+                    // Offset entry - not None
+                    if idx < max_idx && target_mask.is_set(idx) {
+                        return Ok(true);
+                    }
+                    idx += 1;
+                }
+                Ordering::Less | Ordering::Equal => {
+                    // Alias entry - not None
+                    if idx < max_idx && target_mask.is_set(idx) {
+                        return Ok(true);
+                    }
+                    idx += 1;
+                }
+            }
+        } else {
+            // Block of None entries
+            let (value, _) = read_variant_u32(&mut chain_bytes)?;
+            let zeros = value >> 1;
+            let skip_zeros = zeros as usize;
+            
+            let end_idx = std::cmp::min(idx + skip_zeros, max_idx);
+            // Check if any signal in this block is in target_mask
+            for check_idx in idx..end_idx {
+                if target_mask.is_set(check_idx) {
+                    // We have a target signal in this None block - skip, but keep checking
+                    // the signal itself is None, but maybe others later
+                }
+            }
+            idx = end_idx;
+        }
+    }
+    
+    Ok(false)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

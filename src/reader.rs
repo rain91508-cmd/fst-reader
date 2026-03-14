@@ -1166,6 +1166,22 @@ impl<'a, R: Read + Seek> PreStartReader<'a, R> {
         let vc_start = self.input.stream_position()?;
         let packtpe = ValueChangePackType::from_u8(read_u8(&mut self.input)?);
         let chain_len_offset = section_start + section_length - time_section_length - 8;
+        
+        // 优化：先快速检查是否有需要的信号，没有就直接跳过
+        let has_relevant_signals = check_any_signal_loc_non_none(
+            &mut self.input,
+            chain_len_offset,
+            section_kind,
+            max_handle,
+            &self.filter.signals,
+        )?;
+        
+        if !has_relevant_signals {
+            // 这个数据块里没有我们需要的信号，直接返回
+            return Ok(());
+        }
+        
+        // 现在读取完整的 signal_offsets
         let signal_offsets = read_signal_locs(
             &mut self.input,
             chain_len_offset,
@@ -1173,16 +1189,6 @@ impl<'a, R: Read + Seek> PreStartReader<'a, R> {
             max_handle,
             vc_start,
         )?;
-
-        // 优化：检查这个数据块里有没有任何我们需要的信号
-        let has_relevant_signals = signal_offsets.iter().any(|entry| {
-            self.filter.signals.is_set(entry.signal_idx)
-        });
-        
-        if !has_relevant_signals {
-            // 这个数据块里没有我们需要的信号，直接返回
-            return Ok(());
-        }
 
         let mut mu: Vec<u8> = Vec::new();
         let mut head_pointer = vec![0u32; max_handle as usize];
@@ -1448,6 +1454,22 @@ impl<'a, R: Read + Seek> RangeBoundaryReader<'a, R> {
             let vc_start = self.input.stream_position()?;
             let packtpe = ValueChangePackType::from_u8(read_u8(&mut self.input)?);
             let chain_len_offset = section.file_offset + section_length - time_section_length - 8;
+            
+            // 优化：先快速检查是否有需要的信号，没有就直接跳过
+            let has_needed_signals = check_any_signal_loc_non_none(
+                &mut self.input,
+                chain_len_offset,
+                section.kind,
+                max_handle,
+                &search_mask,
+            )?;
+            
+            if !has_needed_signals {
+                // 这个块没有需要的信号，跳过整个块
+                continue;
+            }
+            
+            // 现在读取完整的 signal_offsets
             let signal_offsets = read_signal_locs(
                 &mut self.input,
                 chain_len_offset,
@@ -1455,16 +1477,6 @@ impl<'a, R: Read + Seek> RangeBoundaryReader<'a, R> {
                 max_handle,
                 vc_start,
             )?;
-
-            // 检查这个数据块里有没有 search_mask 中的信号
-            let has_needed_signals = signal_offsets.iter().any(|entry| {
-                search_mask.is_set(entry.signal_idx)
-            });
-            
-            if !has_needed_signals {
-                // 这个块没有需要的信号，跳过整个块
-                continue;
-            }
 
             // 对于每个信号，沿着变化链遍历，找到第一个在 [start, end] 范围内的变化
             let eof_error = || {
